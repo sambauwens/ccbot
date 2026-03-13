@@ -1,13 +1,15 @@
 """Application configuration — reads env vars and exposes a singleton.
 
-Loads TELEGRAM_BOT_TOKEN, ALLOWED_USERS, tmux/Claude paths, and
-monitoring intervals from environment variables (with .env support).
+Loads TELEGRAM_BOT_TOKEN, ALLOWED_USERS, tmux/Claude paths, project
+group mappings, and monitoring intervals from environment variables
+(with .env support).
 .env loading priority: local .env (cwd) > $CCBOT_DIR/.env (default ~/.ccbot).
 The module-level `config` instance is imported by nearly every other module.
 
 Key class: Config (singleton instantiated as `config`).
 """
 
+import json
 import logging
 import os
 from pathlib import Path
@@ -57,10 +59,6 @@ class Config:
                 "Expected comma-separated Telegram user IDs."
             ) from e
 
-        # Tmux session name and window naming
-        self.tmux_session_name = os.getenv("TMUX_SESSION_NAME", "ccbot")
-        self.tmux_main_window_name = "__main__"
-
         # Claude command to run in new windows
         self.claude_command = os.getenv("CLAUDE_COMMAND", "claude")
 
@@ -68,6 +66,28 @@ class Config:
         self.state_file = self.config_dir / "state.json"
         self.session_map_file = self.config_dir / "session_map.json"
         self.monitor_state_file = self.config_dir / "monitor_state.json"
+
+        # --- Multi-project group routing ---
+        # PROJECT_GROUPS: JSON mapping project name → Telegram group chat_id
+        # e.g. {"france-2026": -100123, "outstanding": -100456}
+        # PROJECTS_DIR: base directory for projects (default ~/dev/@active)
+        self.projects_dir = Path(
+            os.getenv("CCBOT_PROJECTS_DIR", str(Path.home() / "dev" / "@active"))
+        )
+        groups_json = os.getenv("PROJECT_GROUPS", "{}")
+        try:
+            raw_groups = json.loads(groups_json)
+            self.project_groups: dict[str, int] = {
+                str(k): int(v) for k, v in raw_groups.items()
+            }
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.warning("Failed to parse PROJECT_GROUPS: %s", e)
+            self.project_groups = {}
+
+        # Reverse mapping: group_chat_id → project name
+        self.group_to_project: dict[int, str] = {
+            v: k for k, v in self.project_groups.items()
+        }
 
         # Claude Code session monitoring configuration
         # Support custom projects path for Claude variants (e.g., cc-mirror, zai)
@@ -84,9 +104,17 @@ class Config:
 
         self.monitor_poll_interval = float(os.getenv("MONITOR_POLL_INTERVAL", "2.0"))
 
+        # Reminder monitoring interval in seconds (default: 6 hours)
+        self.reminder_interval = float(os.getenv("REMINDER_INTERVAL", str(6 * 3600)))
+
         # Display user messages in history and real-time notifications
         # When True, user messages are shown with a 👤 prefix
         self.show_user_messages = True
+
+        # Show thinking blocks (∴ Thinking...) in Telegram
+        self.show_thinking = os.getenv("CCBOT_SHOW_THINKING", "").lower() == "true"
+        # Show tool_use/tool_result messages (Read, Write, Bash, etc.)
+        self.show_tool_messages = os.getenv("CCBOT_SHOW_TOOLS", "").lower() == "true"
 
         # Show hidden (dot) directories in directory browser
         self.show_hidden_dirs = (
@@ -106,17 +134,25 @@ class Config:
 
         logger.debug(
             "Config initialized: dir=%s, token=%s..., allowed_users=%d, "
-            "tmux_session=%s, claude_projects_path=%s",
+            "project_groups=%s, claude_projects_path=%s",
             self.config_dir,
             self.telegram_bot_token[:8],
             len(self.allowed_users),
-            self.tmux_session_name,
+            list(self.project_groups.keys()),
             self.claude_projects_path,
         )
 
     def is_user_allowed(self, user_id: int) -> bool:
         """Check if a user is in the allowed list."""
         return user_id in self.allowed_users
+
+    def project_dir(self, project_name: str) -> Path:
+        """Resolve the directory for a project by convention."""
+        return self.projects_dir / project_name
+
+    def project_for_group(self, chat_id: int) -> str | None:
+        """Look up the project name for a Telegram group chat_id."""
+        return self.group_to_project.get(chat_id)
 
 
 config = Config()

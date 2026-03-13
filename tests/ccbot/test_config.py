@@ -23,10 +23,11 @@ class TestConfigValid:
         assert cfg.telegram_bot_token == "test:token"
         assert cfg.allowed_users == {12345}
 
-    def test_custom_tmux_session_name(self, monkeypatch):
-        monkeypatch.setenv("TMUX_SESSION_NAME", "mysession")
+    def test_project_groups_parsing(self, monkeypatch):
+        monkeypatch.setenv("PROJECT_GROUPS", '{"france-2026": -100123}')
         cfg = Config()
-        assert cfg.tmux_session_name == "mysession"
+        assert cfg.project_groups == {"france-2026": -100123}
+        assert cfg.group_to_project == {-100123: "france-2026"}
 
     def test_custom_monitor_poll_interval(self, monkeypatch):
         monkeypatch.setenv("MONITOR_POLL_INTERVAL", "5.0")

@@ -351,6 +351,13 @@ class SessionMonitor:
                     # Skip user messages unless show_user_messages is enabled
                     if entry.role == "user" and not config.show_user_messages:
                         continue
+                    if entry.content_type == "thinking" and not config.show_thinking:
+                        continue
+                    if (
+                        entry.content_type in ("tool_use", "tool_result")
+                        and not config.show_tool_messages
+                    ):
+                        continue
                     new_messages.append(
                         NewMessage(
                             session_id=session_info.session_id,
@@ -376,10 +383,8 @@ class SessionMonitor:
         """Load current session_map and return window_key -> session_id mapping.
 
         Keys in session_map are formatted as "tmux_session:window_id"
-        (e.g. "ccbot:@12"). Old-format keys ("ccbot:window_name") are also
-        accepted so that sessions running before a code upgrade continue
-        to be monitored until the hook re-fires with new format.
-        Only entries matching our tmux_session_name are processed.
+        (e.g. "france-2026:@12"). All entries are processed regardless of
+        tmux session name (session-per-instance model).
         """
         window_to_session: dict[str, str] = {}
         if config.session_map_file.exists():
@@ -387,12 +392,14 @@ class SessionMonitor:
                 async with aiofiles.open(config.session_map_file, "r") as f:
                     content = await f.read()
                 session_map = json.loads(content)
-                prefix = f"{config.tmux_session_name}:"
                 for key, info in session_map.items():
-                    # Only process entries for our tmux session
-                    if not key.startswith(prefix):
-                        continue
-                    window_key = key[len(prefix) :]
+                    # Extract window_id from key (format: "session_name:@id")
+                    idx = key.rfind(":@")
+                    if idx < 0:
+                        # Old format or unrecognized — use whole key
+                        window_key = key
+                    else:
+                        window_key = key[idx + 1 :]
                     session_id = info.get("session_id", "")
                     if session_id:
                         window_to_session[window_key] = session_id

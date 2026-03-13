@@ -346,11 +346,8 @@ class SessionManager:
         except (json.JSONDecodeError, OSError):
             return
 
-        prefix = f"{config.tmux_session_name}:"
         old_keys = [
-            key
-            for key in session_map
-            if key.startswith(prefix) and not self._is_window_id(key[len(prefix) :])
+            key for key in session_map if self._extract_window_id_from_key(key) is None
         ]
         if not old_keys:
             return
@@ -378,14 +375,12 @@ class SessionManager:
         except (json.JSONDecodeError, OSError):
             return
 
-        prefix = f"{config.tmux_session_name}:"
-        stale_keys = [
-            key
-            for key in session_map
-            if key.startswith(prefix)
-            and self._is_window_id(key[len(prefix) :])
-            and key[len(prefix) :] not in live_ids
-        ]
+        stale_keys = []
+        for key in session_map:
+            wid = self._extract_window_id_from_key(key)
+            if wid and self._is_window_id(wid) and wid not in live_ids:
+                stale_keys.append(key)
+
         if not stale_keys:
             return
 
@@ -465,6 +460,7 @@ class SessionManager:
     ) -> bool:
         """Poll session_map.json until an entry for window_id appears.
 
+        Searches all entries whose key ends with :{window_id} (any tmux session).
         Returns True if the entry was found within timeout, False otherwise.
         """
         logger.debug(
@@ -472,7 +468,7 @@ class SessionManager:
             window_id,
             timeout,
         )
-        key = f"{config.tmux_session_name}:{window_id}"
+        suffix = f":{window_id}"
         deadline = asyncio.get_event_loop().time() + timeout
         while asyncio.get_event_loop().time() < deadline:
             try:
@@ -480,14 +476,13 @@ class SessionManager:
                     async with aiofiles.open(config.session_map_file, "r") as f:
                         content = await f.read()
                     session_map = json.loads(content)
-                    info = session_map.get(key, {})
-                    if info.get("session_id"):
-                        # Found — load into window_states immediately
-                        logger.debug(
-                            "session_map entry found for window_id %s", window_id
-                        )
-                        await self.load_session_map()
-                        return True
+                    for key, info in session_map.items():
+                        if key.endswith(suffix) and info.get("session_id"):
+                            logger.debug(
+                                "session_map entry found for window_id %s", window_id
+                            )
+                            await self.load_session_map()
+                            return True
             except (json.JSONDecodeError, OSError):
                 pass
             await asyncio.sleep(interval)
@@ -496,11 +491,21 @@ class SessionManager:
         )
         return False
 
+    @staticmethod
+    def _extract_window_id_from_key(key: str) -> str | None:
+        """Extract window_id from a session_map key like 'session_name:@12'."""
+        # Key format: "tmux_session_name:@id"
+        idx = key.rfind(":@")
+        if idx >= 0:
+            return key[idx + 1 :]
+        return None
+
     async def load_session_map(self) -> None:
         """Read session_map.json and update window_states with new session associations.
 
-        Keys in session_map are formatted as "tmux_session:window_id" (e.g. "ccbot:@12").
-        Only entries matching our tmux_session_name are processed.
+        Keys in session_map are formatted as "tmux_session:window_id"
+        (e.g. "france-2026:@12"). All entries are processed regardless of
+        tmux session name (session-per-instance model).
         Also cleans up window_states entries not in current session_map.
         Updates window_display_names from the "window_name" field in values.
         """
@@ -513,16 +518,12 @@ class SessionManager:
         except (json.JSONDecodeError, OSError):
             return
 
-        prefix = f"{config.tmux_session_name}:"
         valid_wids: set[str] = set()
         changed = False
 
         for key, info in session_map.items():
-            # Only process entries for our tmux session
-            if not key.startswith(prefix):
-                continue
-            window_id = key[len(prefix) :]
-            if not self._is_window_id(window_id):
+            window_id = self._extract_window_id_from_key(key)
+            if not window_id or not self._is_window_id(window_id):
                 continue
             valid_wids.add(window_id)
             new_sid = info.get("session_id", "")
@@ -597,7 +598,10 @@ class SessionManager:
 
         # Fallback: glob search if direct path doesn't exist
         if not file_path or not file_path.exists():
-            pattern = f"*/{session_id}.jsonl"
+            import glob as glob_mod
+
+            safe_id = glob_mod.escape(session_id)
+            pattern = f"*/{safe_id}.jsonl"
             matches = list(config.claude_projects_path.glob(pattern))
             if matches:
                 file_path = matches[0]

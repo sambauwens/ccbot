@@ -35,6 +35,7 @@ Key functions: create_bot(), handle_new_message().
 import asyncio
 import io
 import logging
+import re
 import time
 from pathlib import Path
 
@@ -134,17 +135,30 @@ from .session import session_manager
 from .session_monitor import NewMessage, SessionMonitor
 from .terminal_parser import extract_bash_output, is_interactive_ui
 from .tmux_manager import tmux_manager
+from .reminder_monitor import handle_reminder_callback, start_reminder_loop
 from .transcribe import close_client as close_transcribe_client
 from .transcribe import transcribe_voice
 from .utils import ccbot_dir
 
 logger = logging.getLogger(__name__)
 
+# Validate tmux window IDs from callback data (prevent injection)
+_WINDOW_ID_RE = re.compile(r"^@\d+$")
+
+
+def _is_valid_window_id(window_id: str) -> bool:
+    """Check that a window ID has the expected @<digits> format."""
+    return bool(_WINDOW_ID_RE.match(window_id))
+
+
 # Session monitor instance
 session_monitor: SessionMonitor | None = None
 
 # Status polling task
 _status_poll_task: asyncio.Task | None = None
+
+# Reminder monitor task
+_reminder_task: asyncio.Task | None = None
 
 # Claude Code commands shown in bot menu (forwarded via tmux)
 CC_COMMANDS: dict[str, str] = {
@@ -799,6 +813,136 @@ async def _capture_bash_output(
         _bash_capture_tasks.pop((user_id, thread_id), None)
 
 
+def _resolve_project_for_chat(chat: object) -> str | None:
+    """Resolve a project name from a Telegram chat (group) via PROJECT_GROUPS config."""
+    if chat is None:
+        return None
+    chat_id = getattr(chat, "id", None)
+    if chat_id is None:
+        return None
+    return config.project_for_group(chat_id)
+
+
+async def bind_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Bind an existing tmux session to this topic.
+
+    Lists all tmux sessions across all projects, user picks one → binds to current topic.
+    Enables 'start from terminal, continue from phone'.
+    """
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not update.message:
+        return
+
+    thread_id = _get_thread_id(update)
+    if thread_id is None:
+        await safe_reply(update.message, "❌ This command only works in a topic.")
+        return
+
+    # Capture group chat_id
+    chat = update.effective_chat
+    if chat and chat.type in ("group", "supergroup"):
+        session_manager.set_group_chat_id(user.id, thread_id, chat.id)
+
+    # Check if already bound
+    existing_wid = session_manager.get_window_for_thread(user.id, thread_id)
+    if existing_wid:
+        display = session_manager.get_display_name(existing_wid)
+        await safe_reply(
+            update.message,
+            f"❌ This topic is already bound to `{display}`.\n"
+            "Use /unbind first to disconnect it.",
+        )
+        return
+
+    # List all tmux sessions/windows, show unbound ones
+    all_windows = await tmux_manager.list_windows()
+    bound_ids = {wid for _, _, wid in session_manager.iter_thread_bindings()}
+    unbound = [
+        (w.window_id, w.window_name, w.cwd)
+        for w in all_windows
+        if w.window_id not in bound_ids
+    ]
+
+    if not unbound:
+        await safe_reply(
+            update.message,
+            "❌ No unbound tmux sessions available.\n"
+            "Start a session from terminal with `dev go new` first.",
+        )
+        return
+
+    msg_text, keyboard, win_ids = build_window_picker(unbound)
+    if context.user_data is not None:
+        context.user_data[STATE_KEY] = STATE_SELECTING_WINDOW
+        context.user_data[UNBOUND_WINDOWS_KEY] = win_ids
+        context.user_data["_pending_thread_id"] = thread_id
+        context.user_data["_pending_thread_text"] = None  # No pending text for /bind
+    await safe_reply(update.message, msg_text, reply_markup=keyboard)
+
+
+async def mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Switch Claude Code permission mode for the session bound to this topic."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not update.message:
+        return
+
+    thread_id = _get_thread_id(update)
+    wid = session_manager.resolve_window_for_thread(user.id, thread_id)
+    if not wid:
+        await safe_reply(update.message, "❌ No session bound to this topic.")
+        return
+
+    # Parse argument
+    text = update.message.text or ""
+    parts = text.strip().split(maxsplit=1)
+    if len(parts) < 2:
+        # Show current options
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("Auto", callback_data=f"mode:auto:{wid}"),
+                    InlineKeyboardButton(
+                        "Accept edits", callback_data=f"mode:edit:{wid}"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton("Plan", callback_data=f"mode:plan:{wid}"),
+                    InlineKeyboardButton(
+                        "Approve all", callback_data=f"mode:approve:{wid}"
+                    ),
+                ],
+            ]
+        )
+        await safe_reply(
+            update.message, "Select permission mode:", reply_markup=keyboard
+        )
+        return
+
+    mode_arg = parts[1].lower().strip()
+    mode_flags = {
+        "auto": "--dangerously-skip-permissions",
+        "edit": "--allowedTools Edit,Write,NotebookEdit",
+        "plan": "--allowedTools ''",
+        "approve": "",
+    }
+    if mode_arg not in mode_flags:
+        await safe_reply(
+            update.message,
+            f"❌ Unknown mode `{mode_arg}`.\nValid: auto, edit, plan, approve",
+        )
+        return
+
+    await safe_reply(
+        update.message,
+        f"⚠ Mode switching requires restarting Claude.\n"
+        f"Use `/esc` to exit current session, then start a new topic with mode `{mode_arg}`.",
+    )
+
+
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if not user or not is_user_allowed(user.id):
@@ -879,11 +1023,70 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     wid = session_manager.get_window_for_thread(user.id, thread_id)
     if wid is None:
-        # Unbound topic — check for unbound windows first
+        # Unbound topic — check if this is a project group
+        project_name = _resolve_project_for_chat(chat)
+        if project_name:
+            # Project group: auto-create session in the project directory
+            project_dir = str(config.project_dir(project_name))
+            logger.info(
+                "Unbound topic in project group '%s': creating session at %s "
+                "(user=%d, thread=%d)",
+                project_name,
+                project_dir,
+                user.id,
+                thread_id,
+            )
+            await safe_reply(
+                update.message, f"⏳ Creating session in `{project_name}`..."
+            )
+
+            # Store pending text for after creation
+            if context.user_data is not None:
+                context.user_data["_pending_thread_id"] = thread_id
+                context.user_data["_pending_thread_text"] = text
+
+            (
+                success,
+                message,
+                created_name,
+                created_wid,
+            ) = await tmux_manager.create_window(project_dir, window_name=project_name)
+            if success:
+                # Wait for hook registration
+                await session_manager.wait_for_session_map_entry(
+                    created_wid, timeout=5.0
+                )
+                session_manager.bind_thread(
+                    user.id, thread_id, created_wid, window_name=created_name
+                )
+                # Rename the topic
+                resolved_chat = session_manager.resolve_chat_id(user.id, thread_id)
+                try:
+                    await context.bot.edit_forum_topic(
+                        chat_id=resolved_chat,
+                        message_thread_id=thread_id,
+                        name=created_name,
+                    )
+                except Exception as e:
+                    logger.debug("Failed to rename topic: %s", e)
+                # Forward the pending text
+                send_ok, send_msg = await session_manager.send_to_window(
+                    created_wid, text
+                )
+                if not send_ok:
+                    await safe_reply(update.message, f"❌ {send_msg}")
+            else:
+                await safe_reply(update.message, f"❌ {message}")
+            if context.user_data is not None:
+                context.user_data.pop("_pending_thread_id", None)
+                context.user_data.pop("_pending_thread_text", None)
+            return
+
+        # Not a project group — fall back to window picker / directory browser
         all_windows = await tmux_manager.list_windows()
         bound_ids = {wid for _, _, wid in session_manager.iter_thread_bindings()}
         unbound = [
-            (w.window_id, w.window_name, w.cwd)
+            (w.window_id, w.session_name or w.window_name, w.cwd)
             for w in all_windows
             if w.window_id not in bound_ids
         ]
@@ -1134,6 +1337,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     data = query.data
+
+    # Handle reminder callbacks first (rem:+1d:..., rem:done:...)
+    if data.startswith("rem:"):
+        handled = await handle_reminder_callback(context.bot, data, query)
+        if handled:
+            return
 
     # Capture group chat_id for supergroup forum topic routing.
     # Required: Telegram Bot API needs group chat_id (not user_id) to send
@@ -1536,6 +1745,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # Screenshot: Refresh
     elif data.startswith(CB_SCREENSHOT_REFRESH):
         window_id = data[len(CB_SCREENSHOT_REFRESH) :]
+        if not _is_valid_window_id(window_id):
+            await query.answer("Invalid window ID")
+            return
         w = await tmux_manager.find_window_by_id(window_id)
         if not w:
             await query.answer("Window no longer exists", show_alert=True)
@@ -1560,12 +1772,35 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             logger.error(f"Failed to refresh screenshot: {e}")
             await query.answer("Failed to refresh", show_alert=True)
 
+    # Mode switching callback
+    elif data.startswith("mode:"):
+        parts = data.split(":")
+        if len(parts) >= 3:
+            mode_name = parts[1]
+            mode_labels = {
+                "auto": "Auto (no prompts)",
+                "edit": "Accept edits",
+                "plan": "Plan only",
+                "approve": "Approve all",
+            }
+            label = mode_labels.get(mode_name, mode_name)
+            await safe_edit(
+                query,
+                f"⚠ Mode `{label}` selected.\n"
+                "Mode switching requires restarting Claude.\n"
+                "Use /esc to exit current session, then create a new topic.",
+            )
+        await query.answer()
+
     elif data == "noop":
         await query.answer()
 
     # Interactive UI: Up arrow
     elif data.startswith(CB_ASK_UP):
         window_id = data[len(CB_ASK_UP) :]
+        if not _is_valid_window_id(window_id):
+            await query.answer("Invalid window ID")
+            return
         thread_id = _get_thread_id(update)
         w = await tmux_manager.find_window_by_id(window_id)
         if w:
@@ -1577,6 +1812,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # Interactive UI: Down arrow
     elif data.startswith(CB_ASK_DOWN):
         window_id = data[len(CB_ASK_DOWN) :]
+        if not _is_valid_window_id(window_id):
+            await query.answer("Invalid window ID")
+            return
         thread_id = _get_thread_id(update)
         w = await tmux_manager.find_window_by_id(window_id)
         if w:
@@ -1590,6 +1828,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # Interactive UI: Left arrow
     elif data.startswith(CB_ASK_LEFT):
         window_id = data[len(CB_ASK_LEFT) :]
+        if not _is_valid_window_id(window_id):
+            await query.answer("Invalid window ID")
+            return
         thread_id = _get_thread_id(update)
         w = await tmux_manager.find_window_by_id(window_id)
         if w:
@@ -1603,6 +1844,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # Interactive UI: Right arrow
     elif data.startswith(CB_ASK_RIGHT):
         window_id = data[len(CB_ASK_RIGHT) :]
+        if not _is_valid_window_id(window_id):
+            await query.answer("Invalid window ID")
+            return
         thread_id = _get_thread_id(update)
         w = await tmux_manager.find_window_by_id(window_id)
         if w:
@@ -1616,6 +1860,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # Interactive UI: Escape
     elif data.startswith(CB_ASK_ESC):
         window_id = data[len(CB_ASK_ESC) :]
+        if not _is_valid_window_id(window_id):
+            await query.answer("Invalid window ID")
+            return
         thread_id = _get_thread_id(update)
         w = await tmux_manager.find_window_by_id(window_id)
         if w:
@@ -1628,6 +1875,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # Interactive UI: Enter
     elif data.startswith(CB_ASK_ENTER):
         window_id = data[len(CB_ASK_ENTER) :]
+        if not _is_valid_window_id(window_id):
+            await query.answer("Invalid window ID")
+            return
         thread_id = _get_thread_id(update)
         w = await tmux_manager.find_window_by_id(window_id)
         if w:
@@ -1641,6 +1891,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # Interactive UI: Space
     elif data.startswith(CB_ASK_SPACE):
         window_id = data[len(CB_ASK_SPACE) :]
+        if not _is_valid_window_id(window_id):
+            await query.answer("Invalid window ID")
+            return
         thread_id = _get_thread_id(update)
         w = await tmux_manager.find_window_by_id(window_id)
         if w:
@@ -1654,6 +1907,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # Interactive UI: Tab
     elif data.startswith(CB_ASK_TAB):
         window_id = data[len(CB_ASK_TAB) :]
+        if not _is_valid_window_id(window_id):
+            await query.answer("Invalid window ID")
+            return
         thread_id = _get_thread_id(update)
         w = await tmux_manager.find_window_by_id(window_id)
         if w:
@@ -1665,6 +1921,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # Interactive UI: refresh display
     elif data.startswith(CB_ASK_REFRESH):
         window_id = data[len(CB_ASK_REFRESH) :]
+        if not _is_valid_window_id(window_id):
+            await query.answer("Invalid window ID")
+            return
         thread_id = _get_thread_id(update)
         await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
         await query.answer("🔄")
@@ -1678,6 +1937,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             return
         key_id = rest[:colon_idx]
         window_id = rest[colon_idx + 1 :]
+        if not _is_valid_window_id(window_id):
+            await query.answer("Invalid window ID")
+            return
 
         key_info = _KEYS_SEND_MAP.get(key_id)
         if not key_info:
@@ -1816,6 +2078,8 @@ async def post_init(application: Application) -> None:
         BotCommand("esc", "Send Escape to interrupt Claude"),
         BotCommand("kill", "Kill session and delete topic"),
         BotCommand("unbind", "Unbind topic from session (keeps window running)"),
+        BotCommand("bind", "Bind an existing tmux session to this topic"),
+        BotCommand("mode", "Switch permission mode (auto/edit/plan/approve)"),
         BotCommand("usage", "Show Claude Code usage remaining"),
     ]
     # Add Claude Code slash commands
@@ -1852,9 +2116,16 @@ async def post_init(application: Application) -> None:
     _status_poll_task = asyncio.create_task(status_poll_loop(application.bot))
     logger.info("Status polling task started")
 
+    # Start reminder monitor if project groups are configured
+    if config.project_groups:
+        _reminder_task = start_reminder_loop(application.bot)
+        logger.info(
+            "Reminder monitor started (interval: %ds)", config.reminder_interval
+        )
+
 
 async def post_shutdown(application: Application) -> None:
-    global _status_poll_task
+    global _status_poll_task, _reminder_task
 
     # Stop status polling
     if _status_poll_task:
@@ -1865,6 +2136,16 @@ async def post_shutdown(application: Application) -> None:
             pass
         _status_poll_task = None
         logger.info("Status polling stopped")
+
+    # Stop reminder monitor
+    if _reminder_task:
+        _reminder_task.cancel()
+        try:
+            await _reminder_task
+        except asyncio.CancelledError:
+            pass
+        _reminder_task = None
+        logger.info("Reminder monitor stopped")
 
     # Stop all queue workers
     await shutdown_workers()
@@ -1891,6 +2172,8 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("screenshot", screenshot_command))
     application.add_handler(CommandHandler("esc", esc_command))
     application.add_handler(CommandHandler("unbind", unbind_command))
+    application.add_handler(CommandHandler("bind", bind_command))
+    application.add_handler(CommandHandler("mode", mode_command))
     application.add_handler(CommandHandler("usage", usage_command))
     application.add_handler(CallbackQueryHandler(callback_handler))
     # Topic closed event — auto-kill associated window

@@ -80,7 +80,8 @@ def build_window_picker(
     """Build window picker UI for unbound tmux windows.
 
     Args:
-        windows: List of (window_id, window_name, cwd) tuples.
+        windows: List of (window_id, display_name, cwd) tuples.
+            display_name is typically the tmux session name.
 
     Returns: (text, keyboard, window_ids) where window_ids is the ordered list for caching.
     """
