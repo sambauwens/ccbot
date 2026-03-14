@@ -272,12 +272,17 @@ topic_types: dict[str, str]     # "chat_id:thread_id" → "conversational" | "de
 - [ ] Auto-restart idle conversational sessions (kill + resume on next message)
 - [ ] Dev session completion → notification to source conversational topic
 - [ ] Reminder routing to General topic
+- [ ] Write `docs/retrospective.md` — reference doc for how to run retrospectives,
+      evolving over time. Covers: timeline reconstruction, Five Whys, blameless framing,
+      policies vs projects output format, evidence chains, session-explorer usage,
+      commit history analysis. Bot uses this to prompt Claude when triggering retros.
 - [ ] Auto-retrospective on plan completion: when a worktree is merged ($merge) or
       detected as completed externally, the bot triggers a retrospective —
       uses session-explorer to reconstruct the implementation timeline from the
       worktree's Claude sessions, compares actual work vs claude instructions,
       identifies what went wrong / well / could improve, and writes a
       retrospective document to the project (policies + projects format).
+      Bot reads docs/retrospective.md to structure the retro prompt.
       Should work for both bot-managed ($accept→$merge) and externally-started work.
 - [ ] Retrospective of THIS implementation (our current plan) — one-off, do when Phase 5 is done
 
