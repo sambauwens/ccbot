@@ -77,11 +77,11 @@ Enable non-developers (Nathalie) to collaborate on projects through Telegram, wh
 
 | # | Story | Status | Details |
 |---|-------|--------|---------|
-| S1 | Conversational session permission lifecycle | **needs rework** | [→ story](stories/s1-permission-lifecycle/story.md) — Read-only by default, $plan elevates to --dangerously-skip-permissions, $accept delegates to worktree and returns to read-only. Currently missing: $plan elevation kills/restarts session, $accept de-escalation not implemented, no permission state tracking. |
-| S2 | Conversational topic as broker | review needed | [→ story](stories/s2-conversational-broker/story.md) — Architecture docs need update. Code works but isn't documented as a broker model. |
-| S3 | Dev session UX | done | [→ story](stories/s3-dev-session-ux/story.md) — Input channel for terminal work. Photos, voice, text all forward to tmux. |
-| S4 | $plan → $accept → worktree flow | **needs rework** | [→ story](stories/s4-plan-accept-flow/story.md) — Depends on S1. $accept asks conversational Claude to write plan but session will be read-only after de-escalation. Need to write plan BEFORE de-escalating. |
-| S5 | Subject change detection | done (needs testing) | [→ story](stories/s5-subject-detection/story.md) — Via session instruction. Untested whether Claude actually suggests $new/$plan in practice. |
-| S6 | Tmux bidirectional sync | done | [→ story](stories/s6-tmux-sync/story.md) — Full bidirectional sync working: create/close either side, startup reconciliation. |
-| S7 | Completion + retrospective | done (one gap) | [→ story](stories/s7-completion-retro/story.md) — $merge, stale reminders, auto-retro all work. Gap: _worktree_sources not persisted across restart. |
-| S8 | GitHub links | done (gaps) | [→ story](stories/s8-github-links/story.md) — Basic link injection works. Gaps: header anchors not matched, remote URL not cached. |
+| S1 | Conversational session permission lifecycle | ✅ done | [→ story](stories/s1-permission-lifecycle/story.md) — Read-only by default, $plan elevates via kill+restart+resume, $accept de-escalates back. Permission state persisted. |
+| S2 | Conversational topic as broker | ✅ done | [→ story](stories/s2-conversational-broker/story.md) — Documented as broker model. Code uses topic_bindings (per-topic, not per-session). |
+| S3 | Dev session UX | ✅ done | [→ story](stories/s3-dev-session-ux/story.md) — Input channel for terminal work. Photos, voice, text all forward to tmux. |
+| S4 | $plan → $accept → worktree flow | ✅ done | [→ story](stories/s4-plan-accept-flow/story.md) — Plan written while elevated, then de-escalation to read-only. Worktree creation, pool update, dev session spawning all work. |
+| S5 | Subject change detection | ✅ done (needs manual testing) | [→ story](stories/s5-subject-detection/story.md) — Via session instruction. |
+| S6 | Tmux bidirectional sync | ✅ done | [→ story](stories/s6-tmux-sync/story.md) — Full bidirectional sync with startup reconciliation. |
+| S7 | Completion + retrospective | ✅ done | [→ story](stories/s7-completion-retro/story.md) — $merge, stale reminders, auto-retro. worktree_sources now persisted. |
+| S8 | GitHub links | ✅ done (header anchors deferred) | [→ story](stories/s8-github-links/story.md) — Link injection + remote URL caching. Header anchor matching deferred. |

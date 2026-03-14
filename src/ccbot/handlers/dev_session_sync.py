@@ -183,6 +183,13 @@ async def handle_session_removed(window_id: str, bot: Bot) -> None:
 
     # Send merge reminder to source conversational topic if this was a worktree session
     source = _worktree_sources.pop(display_name, None)
+    # Also check persisted state (survives restart)
+    if not source:
+        persisted_key = session_manager.worktree_sources.pop(display_name, None)
+        if persisted_key:
+            parts = persisted_key.split(":", 1)
+            source = (int(parts[0]), int(parts[1]) if parts[1] != "0" else None)
+            session_manager._save_state()
     if source:
         source_chat_id, source_thread_id = source
         try:

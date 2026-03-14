@@ -73,23 +73,33 @@ def _make_github_link(
     return url
 
 
+# Cache git remote URLs per work_dir to avoid subprocess per message
+_remote_url_cache: dict[str, str | None] = {}
+
+
+def _get_github_base_url(work_dir: str) -> str | None:
+    """Get cached GitHub base URL for a work directory."""
+    if work_dir not in _remote_url_cache:
+        try:
+            remote_url = subprocess.run(
+                ["git", "-C", work_dir, "remote", "get-url", "origin"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            ).stdout.strip()
+            _remote_url_cache[work_dir] = _parse_github_url(remote_url)
+        except Exception:
+            _remote_url_cache[work_dir] = None
+    return _remote_url_cache[work_dir]
+
+
 def _inject_github_links(text: str, work_dir: str) -> str:
     """Post-process text to append GitHub links for referenced file paths.
 
     Scans for file paths relative to the work_dir and appends clickable
     GitHub links. Only processes .md files and common code files.
     """
-    try:
-        remote_url = subprocess.run(
-            ["git", "-C", work_dir, "remote", "get-url", "origin"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        ).stdout.strip()
-    except Exception:
-        return text
-
-    base_url = _parse_github_url(remote_url)
+    base_url = _get_github_base_url(work_dir)
     if not base_url:
         return text
 
@@ -135,6 +145,72 @@ def _inject_github_links(text: str, work_dir: str) -> str:
     return text
 
 
+async def _restart_session_with_permissions(
+    chat_id: int,
+    thread_id: int | None,
+    window_id: str,
+    elevated: bool,
+) -> tuple[bool, str, str]:
+    """Kill current session and restart with different permissions.
+
+    Returns (success, new_window_id, error_message).
+    Uses --resume to preserve conversation context.
+    """
+    from ..bot import _topic_names, _sanitize_tmux_name
+
+    # Get session ID for --resume
+    old_session = await session_manager.resolve_session_for_window(window_id)
+    resume_id = old_session.session_id if old_session else None
+
+    # Kill current session
+    await tmux_manager.kill_window(window_id)
+    session_manager.unbind_topic(chat_id, thread_id)
+
+    # Determine project and working directory
+    project_name = config.project_for_group(chat_id)
+    if not project_name:
+        return False, "", "No project mapped to this group"
+
+    work_dir = _resolve_conversational_dir(project_name)
+    topic_name = _topic_names.get((chat_id, thread_id or 0))
+    tmux_name = f"{project_name}-chat"
+    if topic_name:
+        tmux_name = f"{project_name}-{_sanitize_tmux_name(topic_name)}"
+    elif thread_id is None:
+        tmux_name = f"{project_name}-general"
+
+    if elevated:
+        success, message, created_name, created_wid = await tmux_manager.create_window(
+            work_dir,
+            window_name=tmux_name,
+            skip_permissions=True,
+            resume_session_id=resume_id,
+        )
+    else:
+        success, message, created_name, created_wid = await tmux_manager.create_window(
+            work_dir,
+            window_name=tmux_name,
+            allowed_tools="Read,Glob,Grep,Agent,WebSearch,WebFetch,LSP",
+            resume_session_id=resume_id,
+        )
+
+    if not success:
+        return False, "", message
+
+    timeout = 15.0 if resume_id else 5.0
+    await session_manager.wait_for_session_map_entry(created_wid, timeout=timeout)
+    session_manager.bind_topic(
+        chat_id, thread_id, created_wid,
+        topic_type="conversational", window_name=created_name,
+    )
+
+    # Track permission state
+    perm_state = "elevated" if elevated else "read-only"
+    session_manager.set_topic_permission(chat_id, thread_id, perm_state)
+
+    return True, created_wid, ""
+
+
 async def _handle_plan_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -144,21 +220,46 @@ async def _handle_plan_command(
     window_id: str,
     arg: str,
 ) -> None:
-    """Handle $plan -- instruct Claude to enter planning mode."""
+    """Handle $plan — elevate session to full permissions for planning.
+
+    Kills the read-only session and restarts with --dangerously-skip-permissions
+    + --resume to keep conversation context.
+    """
     assert update.message is not None
+
+    # Already elevated?
+    if session_manager.get_topic_permission(chat_id, thread_id) == "elevated":
+        prompt = (
+            "Continue planning. The user wants to refine the plan. "
+            "Use back-and-forth questions to clarify requirements."
+        )
+        if arg:
+            prompt = f"{prompt}\n\nContext: {arg}"
+        first_name = getattr(update.effective_user, "first_name", "User")
+        await session_manager.send_to_window(window_id, f"[{first_name}] {prompt}")
+        return
+
+    await safe_reply(update.message, "Elevating to planning mode...")
+
+    success, new_wid, err = await _restart_session_with_permissions(
+        chat_id, thread_id, window_id, elevated=True
+    )
+    if not success:
+        await safe_reply(update.message, f"❌ {err}")
+        return
+
+    # Send planning prompt
     prompt = (
-        "Enter plan mode. The user wants to plan changes to the codebase. "
+        "You are now in planning mode with full permissions. "
         "Explore the codebase, research what's needed, and produce a structured plan. "
-        "Use back-and-forth questions to clarify requirements before finalizing."
+        "Write plan files when ready. Use back-and-forth questions to clarify requirements. "
+        "When the plan is ready, tell the user to run $accept <plan-name>."
     )
     if arg:
         prompt = f"{prompt}\n\nContext: {arg}"
 
     first_name = getattr(update.effective_user, "first_name", "User")
-    prefixed = f"[{first_name}] {prompt}"
-    success, msg = await session_manager.send_to_window(window_id, prefixed)
-    if not success:
-        await safe_reply(update.message, f"❌ {msg}")
+    await session_manager.send_to_window(new_wid, f"[{first_name}] {prompt}")
 
 
 async def _handle_accept_command(
@@ -259,11 +360,12 @@ async def _handle_accept_command(
         except Exception as e:
             logger.warning("Failed to update pool file: %s", e)
 
-    # Ask conversational Claude to write the plan to the worktree
+    # Ask conversational Claude to write the plan (while still elevated)
     plan_prompt = (
         f"Write a structured implementation plan to {worktree_path}/.claude/plans/{plan_slug}.md — "
         f"include epic, stories, tasks, and all research context from our conversation. "
-        f"This plan will be used by a new Claude session to implement the changes."
+        f"This plan will be used by a new Claude session to implement the changes. "
+        f"Write the plan now, then say 'Plan written' when done."
     )
     await session_manager.send_to_window(window_id, plan_prompt)
 
@@ -296,6 +398,10 @@ async def _handle_accept_command(
                 )
             _topic_names[(dev_chat_id, new_thread_id)] = worktree_name
             _worktree_sources[worktree_name] = (chat_id, thread_id)
+            # Also persist in session state (survives restart)
+            key = session_manager._topic_key(chat_id, thread_id)
+            session_manager.worktree_sources[worktree_name] = key
+            session_manager._save_state()
 
             # Notify conversational topic with link
             link_chat_id = str(dev_chat_id).replace("-100", "")
@@ -315,6 +421,13 @@ async def _handle_accept_command(
             update.message,
             f"Worktree created at `{worktree_path}`. No dev group configured.",
         )
+
+    # De-escalate conversational session back to read-only
+    ok, new_wid, err = await _restart_session_with_permissions(
+        chat_id, thread_id, window_id, elevated=False
+    )
+    if not ok:
+        logger.warning("Failed to de-escalate after $accept: %s", err)
 
 
 async def _handle_new_command(

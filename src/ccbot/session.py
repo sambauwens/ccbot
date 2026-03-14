@@ -116,6 +116,11 @@ class SessionManager:
     topic_bindings: dict[str, str] = field(default_factory=dict)
     # Topic type tracking: "chat_id:thread_id" -> "conversational" | "dev"
     topic_types: dict[str, str] = field(default_factory=dict)
+    # Permission state: "chat_id:thread_id" -> "read-only" | "elevated"
+    topic_permission_states: dict[str, str] = field(default_factory=dict)
+    # Worktree → source topic mapping (for merge reminders)
+    # worktree_name → "chat_id:thread_id"
+    worktree_sources: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self._load_state()
@@ -134,6 +139,8 @@ class SessionManager:
             "group_chat_ids": self.group_chat_ids,
             "topic_bindings": self.topic_bindings,
             "topic_types": self.topic_types,
+            "topic_permission_states": self.topic_permission_states,
+            "worktree_sources": self.worktree_sources,
         }
         atomic_write_json(config.state_file, state)
         logger.debug("State saved to %s", config.state_file)
@@ -169,6 +176,8 @@ class SessionManager:
                 }
                 self.topic_bindings = state.get("topic_bindings", {})
                 self.topic_types = state.get("topic_types", {})
+                self.topic_permission_states = state.get("topic_permission_states", {})
+                self.worktree_sources = state.get("worktree_sources", {})
 
                 # Detect old format: keys that don't look like window IDs
                 needs_migration = False
@@ -864,6 +873,19 @@ class SessionManager:
     def get_topic_type(self, chat_id: int, thread_id: int | None) -> str | None:
         """Get the type of a topic ('conversational' or 'dev')."""
         return self.topic_types.get(self._topic_key(chat_id, thread_id))
+
+    def get_topic_permission(self, chat_id: int, thread_id: int | None) -> str:
+        """Get permission state: 'read-only' (default) or 'elevated'."""
+        return self.topic_permission_states.get(
+            self._topic_key(chat_id, thread_id), "read-only"
+        )
+
+    def set_topic_permission(
+        self, chat_id: int, thread_id: int | None, state: str
+    ) -> None:
+        """Set permission state for a topic."""
+        self.topic_permission_states[self._topic_key(chat_id, thread_id)] = state
+        self._save_state()
 
     def iter_topic_bindings(self) -> Iterator[tuple[int, int | None, str]]:
         """Iterate topic bindings as (chat_id, thread_id, window_id).
