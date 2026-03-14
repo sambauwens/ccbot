@@ -312,7 +312,9 @@ async def _check_stale_worktrees(
 
             result = subprocess.run(
                 ["git", "-C", str(wt_path), "log", "-1", "--format=%ci"],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True,
+                text=True,
+                timeout=5,
             )
             if result.returncode != 0 or not result.stdout.strip():
                 continue
@@ -343,7 +345,9 @@ async def _check_stale_worktrees(
             state._save()
             logger.info(
                 "Sent stale worktree reminder for %s in %s (%d days idle)",
-                wt_name, project, days_idle,
+                wt_name,
+                project,
+                days_idle,
             )
         except Exception as e:
             logger.error("Failed to send worktree reminder: %s", e)
@@ -357,7 +361,9 @@ async def _check_stale_worktrees(
             for wt_name in removed_worktrees:
                 pool_data.get("worktrees", {}).pop(wt_name, None)
             pool_file.write_text(yaml.dump(pool_data, default_flow_style=False))
-            logger.info("Cleaned up %d removed worktrees from pool", len(removed_worktrees))
+            logger.info(
+                "Cleaned up %d removed worktrees from pool", len(removed_worktrees)
+            )
         except Exception as e:
             logger.warning("Failed to clean up pool file: %s", e)
 
@@ -376,9 +382,7 @@ async def _reminder_loop(bot: object) -> None:
         logger.debug("Reminder check starting")
         for project, group_chat_id in config.conversational_groups.items():
             try:
-                await _send_reminders_for_project(
-                    bot, project, group_chat_id, state
-                )
+                await _send_reminders_for_project(bot, project, group_chat_id, state)
             except Exception as e:
                 logger.error("Reminder check failed for %s: %s", project, e)
 

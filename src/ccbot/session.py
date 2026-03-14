@@ -857,15 +857,11 @@ class SessionManager:
             logger.info("Unbound topic %s (was %s)", key, window_id)
         return window_id
 
-    def get_window_for_topic(
-        self, chat_id: int, thread_id: int | None
-    ) -> str | None:
+    def get_window_for_topic(self, chat_id: int, thread_id: int | None) -> str | None:
         """Look up the window_id bound to a topic."""
         return self.topic_bindings.get(self._topic_key(chat_id, thread_id))
 
-    def get_topic_type(
-        self, chat_id: int, thread_id: int | None
-    ) -> str | None:
+    def get_topic_type(self, chat_id: int, thread_id: int | None) -> str | None:
         """Get the type of a topic ('conversational' or 'dev')."""
         return self.topic_types.get(self._topic_key(chat_id, thread_id))
 

@@ -91,9 +91,9 @@ class SessionMonitor:
         self._new_session_callback: Callable[[NewSession], Awaitable[None]] | None = (
             None
         )
-        self._session_removed_callback: (
-            Callable[[str], Awaitable[None]] | None
-        ) = None  # Called with window_id when a window is deleted
+        self._session_removed_callback: Callable[[str], Awaitable[None]] | None = (
+            None  # Called with window_id when a window is deleted
+        )
         # Per-session pending tool_use state carried across poll cycles
         self._pending_tools: dict[str, dict[str, Any]] = {}  # session_id -> pending
         # Track last known session_map for detecting changes

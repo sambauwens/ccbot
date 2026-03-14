@@ -150,7 +150,9 @@ async def status_poll_loop(bot: Bot) -> None:
                         chat_id = session_manager.resolve_chat_id(user_id, thread_id)
                         from ..config import config
 
-                        if config.is_conversational_group(chat_id) or config.is_dev_group(chat_id):
+                        if config.is_conversational_group(
+                            chat_id
+                        ) or config.is_dev_group(chat_id):
                             try:
                                 await bot.close_forum_topic(
                                     chat_id=chat_id,

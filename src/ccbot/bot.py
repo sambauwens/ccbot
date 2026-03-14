@@ -1,56 +1,37 @@
-"""Telegram bot handlers — the main UI layer of CCBot.
+"""Telegram bot orchestrator -- wires handlers and manages bot lifecycle.
 
-Registers all command/callback/message handlers and manages the bot lifecycle.
-Each Telegram topic maps 1:1 to a tmux window (Claude session).
-
-Core responsibilities:
-  - Command handlers: /start, /history, /screenshot, /esc, /kill, /unbind,
-    plus forwarding unknown /commands to Claude Code via tmux.
-  - Callback query handler: directory browser, history pagination,
-    interactive UI navigation, screenshot refresh.
-  - Topic-based routing: each named topic binds to one tmux window.
-    Unbound topics trigger the directory browser to create a new session.
-  - Photo handling: photos sent by user are downloaded and forwarded
-    to Claude Code as file paths (photo_handler).
-  - Voice handling: voice messages are transcribed via OpenAI API and
-    forwarded as text (voice_handler).
-  - Automatic cleanup: closing a topic kills the associated window
-    (topic_closed_handler). Unsupported content (stickers, etc.)
-    is rejected with a warning (unsupported_content_handler).
-  - Bot lifecycle management: post_init, post_shutdown, create_bot.
+Thin orchestrator that registers all command/callback/message handlers,
+manages shared state, and controls the bot lifecycle (post_init, post_shutdown).
 
 Handler modules (in handlers/):
+  - conversational: Conversational topic handling ($plan, $accept, $new, $merge)
+  - dev_session_sync: Dev group session sync (auto-create/close topics)
+  - session_commands: Session commands (/start, /history, /screenshot, etc.)
+  - topic_lifecycle: Topic lifecycle events (created, closed, edited)
+  - media: Photo, voice, unsupported content, forward command handlers
+  - message_routing: Text message routing and outbound message delivery
   - callback_data: Callback data constants
   - message_queue: Per-user message queue management
   - message_sender: Safe message sending helpers
-  - history: Message history pagination
   - directory_browser: Directory browser UI
   - interactive_ui: Interactive UI handling
   - status_polling: Terminal status polling
   - response_builder: Response message building
 
-Key functions: create_bot(), handle_new_message().
+Key functions: create_bot().
 """
 
 import asyncio
 import io
 import logging
 import re
-import subprocess
-import time
 from pathlib import Path
 
-import yaml
-
 from telegram import (
-    Bot,
     BotCommand,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
     InputMediaDocument,
     Update,
 )
-from telegram.constants import ChatAction
 from telegram.ext import (
     AIORateLimiter,
     Application,
@@ -96,54 +77,71 @@ from .handlers.directory_browser import (
     STATE_BROWSING_DIRECTORY,
     STATE_KEY,
     STATE_SELECTING_SESSION,
-    STATE_SELECTING_WINDOW,
     UNBOUND_WINDOWS_KEY,
     build_directory_browser,
     build_session_picker,
-    build_window_picker,
     clear_browse_state,
     clear_session_picker_state,
     clear_window_picker_state,
 )
-from .handlers.cleanup import clear_topic_state
 from .handlers.history import send_history
 from .handlers.interactive_ui import (
-    INTERACTIVE_TOOL_NAMES,
-    clear_interactive_mode,
     clear_interactive_msg,
-    get_interactive_msg_id,
-    get_interactive_window,
     handle_interactive_ui,
-    set_interactive_mode,
 )
-from .handlers.message_queue import (
-    clear_status_msg_info,
-    enqueue_content_message,
-    enqueue_status_update,
-    get_message_queue,
-    shutdown_workers,
-)
-from .handlers.message_sender import (
-    NO_LINK_PREVIEW,
-    safe_edit,
-    safe_reply,
-    safe_send,
-    send_with_fallback,
-)
-from .markdown_v2 import convert_markdown
-from .handlers.response_builder import build_response_parts
+from .handlers.message_queue import shutdown_workers
+from .handlers.message_sender import safe_edit, safe_send
 from .handlers.status_polling import status_poll_loop
 from .screenshot import text_to_image
 from .session import session_manager
 from .session_monitor import NewMessage, NewSession, SessionMonitor
-from .terminal_parser import extract_bash_output, is_interactive_ui
 from .tmux_manager import tmux_manager
 from .reminder_monitor import handle_reminder_callback, start_reminder_loop
 from .transcribe import close_client as close_transcribe_client
-from .transcribe import transcribe_voice
-from .utils import ccbot_dir
+
+# --- Handler module imports ---
+from .handlers.session_commands import (
+    CC_COMMANDS,
+    start_command,
+    history_command,
+    screenshot_command,
+    esc_command,
+    usage_command,
+    bind_command,
+    unbind_command,
+    mode_command,
+    _build_screenshot_keyboard,
+    _KEYS_SEND_MAP,
+    _KEY_LABELS,
+)
+from .handlers.topic_lifecycle import (
+    topic_closed_handler,
+    topic_created_handler,
+    topic_edited_handler,
+)
+from .handlers.media import (
+    photo_handler,
+    voice_handler,
+    unsupported_content_handler,
+    forward_command_handler,
+)
+from .handlers.message_routing import (
+    text_handler,
+    handle_new_message,
+)
+from .handlers.dev_session_sync import (
+    handle_new_session,
+    reconcile_dev_topics,
+    handle_session_removed,
+)
+
+# Re-exports for backward compatibility (tests import from ccbot.bot)
+from .handlers.conversational import _parse_github_url as _parse_github_url  # noqa: F401
+from .handlers.conversational import _make_github_link as _make_github_link  # noqa: F401
 
 logger = logging.getLogger(__name__)
+
+# --- Shared state (used across handler modules via `from ..bot import`) ---
 
 # Validate tmux window IDs from callback data (prevent injection)
 _WINDOW_ID_RE = re.compile(r"^@\d+$")
@@ -154,7 +152,7 @@ def _is_valid_window_id(window_id: str) -> bool:
     return bool(_WINDOW_ID_RE.match(window_id))
 
 
-# Topic name cache: (chat_id, thread_id) → topic name
+# Topic name cache: (chat_id, thread_id) -> topic name
 # Populated by FORUM_TOPIC_CREATED status messages.
 _topic_names: dict[tuple[int, int], str] = {}
 
@@ -180,7 +178,7 @@ def _sanitize_topic_title(text: str) -> str:
 session_monitor: SessionMonitor | None = None
 
 # Track which conversational topic spawned which worktree (for merge reminders)
-# worktree_name → (source_chat_id, source_thread_id)
+# worktree_name -> (source_chat_id, source_thread_id)
 _worktree_sources: dict[str, tuple[int, int | None]] = {}
 
 # Status polling task
@@ -188,16 +186,6 @@ _status_poll_task: asyncio.Task | None = None
 
 # Reminder monitor task
 _reminder_task: asyncio.Task | None = None
-
-# Claude Code commands shown in bot menu (forwarded via tmux)
-CC_COMMANDS: dict[str, str] = {
-    "clear": "↗ Clear conversation history",
-    "compact": "↗ Compact conversation context",
-    "cost": "↗ Show token/cost usage",
-    "help": "↗ Show Claude Code help",
-    "memory": "↗ Edit CLAUDE.md",
-    "model": "↗ Switch AI model",
-}
 
 
 def is_user_allowed(user_id: int | None) -> bool:
@@ -217,1580 +205,7 @@ def _get_thread_id(update: Update) -> int | None:
     return tid
 
 
-# --- Command handlers ---
-
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    if not user or not is_user_allowed(user.id):
-        if update.message:
-            await safe_reply(update.message, "You are not authorized to use this bot.")
-        return
-
-    clear_browse_state(context.user_data)
-
-    if update.message:
-        await safe_reply(
-            update.message,
-            "🤖 *Claude Code Monitor*\n\n"
-            "Each topic is a session. Create a new topic to start.",
-        )
-
-
-async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show message history for the active session or bound thread."""
-    user = update.effective_user
-    if not user or not is_user_allowed(user.id):
-        return
-    if not update.message:
-        return
-
-    thread_id = _get_thread_id(update)
-    wid = session_manager.resolve_window_for_thread(user.id, thread_id)
-    if not wid:
-        await safe_reply(update.message, "❌ No session bound to this topic.")
-        return
-
-    await send_history(update.message, wid)
-
-
-async def screenshot_command(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    """Capture the current tmux pane and send it as an image."""
-    user = update.effective_user
-    if not user or not is_user_allowed(user.id):
-        return
-    if not update.message:
-        return
-
-    thread_id = _get_thread_id(update)
-    wid = session_manager.resolve_window_for_thread(user.id, thread_id)
-    if not wid:
-        await safe_reply(update.message, "❌ No session bound to this topic.")
-        return
-
-    w = await tmux_manager.find_window_by_id(wid)
-    if not w:
-        display = session_manager.get_display_name(wid)
-        await safe_reply(update.message, f"❌ Window '{display}' no longer exists.")
-        return
-
-    text = await tmux_manager.capture_pane(w.window_id, with_ansi=True)
-    if not text:
-        await safe_reply(update.message, "❌ Failed to capture pane content.")
-        return
-
-    png_bytes = await text_to_image(text, with_ansi=True)
-    keyboard = _build_screenshot_keyboard(wid)
-    await update.message.reply_document(
-        document=io.BytesIO(png_bytes),
-        filename="screenshot.png",
-        reply_markup=keyboard,
-    )
-
-
-async def unbind_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Unbind this topic from its Claude session without killing the window."""
-    user = update.effective_user
-    if not user or not is_user_allowed(user.id):
-        return
-    if not update.message:
-        return
-
-    thread_id = _get_thread_id(update)
-    if thread_id is None:
-        await safe_reply(update.message, "❌ This command only works in a topic.")
-        return
-
-    wid = session_manager.get_window_for_thread(user.id, thread_id)
-    if not wid:
-        await safe_reply(update.message, "❌ No session bound to this topic.")
-        return
-
-    display = session_manager.get_display_name(wid)
-    session_manager.unbind_thread(user.id, thread_id)
-    await clear_topic_state(user.id, thread_id, context.bot, context.user_data)
-
-    await safe_reply(
-        update.message,
-        f"✅ Topic unbound from window '{display}'.\n"
-        "The Claude session is still running in tmux.\n"
-        "Send a message to bind to a new session.",
-    )
-
-
-async def esc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send Escape key to interrupt Claude."""
-    user = update.effective_user
-    if not user or not is_user_allowed(user.id):
-        return
-    if not update.message:
-        return
-
-    thread_id = _get_thread_id(update)
-    wid = session_manager.resolve_window_for_thread(user.id, thread_id)
-    if not wid:
-        await safe_reply(update.message, "❌ No session bound to this topic.")
-        return
-
-    w = await tmux_manager.find_window_by_id(wid)
-    if not w:
-        display = session_manager.get_display_name(wid)
-        await safe_reply(update.message, f"❌ Window '{display}' no longer exists.")
-        return
-
-    # Send Escape control character (no enter)
-    await tmux_manager.send_keys(w.window_id, "\x1b", enter=False)
-    await safe_reply(update.message, "⎋ Sent Escape")
-
-
-async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Fetch Claude Code usage stats from TUI and send to Telegram."""
-    user = update.effective_user
-    if not user or not is_user_allowed(user.id):
-        return
-    if not update.message:
-        return
-
-    thread_id = _get_thread_id(update)
-    wid = session_manager.resolve_window_for_thread(user.id, thread_id)
-    if not wid:
-        await safe_reply(update.message, "No session bound to this topic.")
-        return
-
-    w = await tmux_manager.find_window_by_id(wid)
-    if not w:
-        await safe_reply(update.message, f"Window '{wid}' no longer exists.")
-        return
-
-    # Send /usage command to Claude Code TUI
-    await tmux_manager.send_keys(w.window_id, "/usage")
-    # Wait for the modal to render
-    await asyncio.sleep(2.0)
-    # Capture the pane content
-    pane_text = await tmux_manager.capture_pane(w.window_id)
-    # Dismiss the modal
-    await tmux_manager.send_keys(w.window_id, "Escape", enter=False, literal=False)
-
-    if not pane_text:
-        await safe_reply(update.message, "Failed to capture usage info.")
-        return
-
-    # Try to parse structured usage info
-    from .terminal_parser import parse_usage_output
-
-    usage = parse_usage_output(pane_text)
-    if usage and usage.parsed_lines:
-        text = "\n".join(usage.parsed_lines)
-        await safe_reply(update.message, f"```\n{text}\n```")
-    else:
-        # Fallback: send raw pane capture trimmed
-        trimmed = pane_text.strip()
-        if len(trimmed) > 3000:
-            trimmed = trimmed[:3000] + "\n... (truncated)"
-        await safe_reply(update.message, f"```\n{trimmed}\n```")
-
-
-# --- Screenshot keyboard with quick control keys ---
-
-# key_id → (tmux_key, enter, literal)
-_KEYS_SEND_MAP: dict[str, tuple[str, bool, bool]] = {
-    "up": ("Up", False, False),
-    "dn": ("Down", False, False),
-    "lt": ("Left", False, False),
-    "rt": ("Right", False, False),
-    "esc": ("Escape", False, False),
-    "ent": ("Enter", False, False),
-    "spc": ("Space", False, False),
-    "tab": ("Tab", False, False),
-    "cc": ("C-c", False, False),
-}
-
-# key_id → display label (shown in callback answer toast)
-_KEY_LABELS: dict[str, str] = {
-    "up": "↑",
-    "dn": "↓",
-    "lt": "←",
-    "rt": "→",
-    "esc": "⎋ Esc",
-    "ent": "⏎ Enter",
-    "spc": "␣ Space",
-    "tab": "⇥ Tab",
-    "cc": "^C",
-}
-
-
-def _build_screenshot_keyboard(window_id: str) -> InlineKeyboardMarkup:
-    """Build inline keyboard for screenshot: control keys + refresh."""
-
-    def btn(label: str, key_id: str) -> InlineKeyboardButton:
-        return InlineKeyboardButton(
-            label,
-            callback_data=f"{CB_KEYS_PREFIX}{key_id}:{window_id}"[:64],
-        )
-
-    return InlineKeyboardMarkup(
-        [
-            [btn("␣ Space", "spc"), btn("↑", "up"), btn("⇥ Tab", "tab")],
-            [btn("←", "lt"), btn("↓", "dn"), btn("→", "rt")],
-            [btn("⎋ Esc", "esc"), btn("^C", "cc"), btn("⏎ Enter", "ent")],
-            [
-                InlineKeyboardButton(
-                    "🔄 Refresh",
-                    callback_data=f"{CB_SCREENSHOT_REFRESH}{window_id}"[:64],
-                )
-            ],
-        ]
-    )
-
-
-async def topic_closed_handler(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    """Handle topic closure — kill the associated tmux window and clean up state."""
-    user = update.effective_user
-    if not user or not is_user_allowed(user.id):
-        return
-
-    thread_id = _get_thread_id(update)
-    if thread_id is None:
-        return
-
-    wid = session_manager.get_window_for_thread(user.id, thread_id)
-    if wid:
-        display = session_manager.get_display_name(wid)
-        w = await tmux_manager.find_window_by_id(wid)
-        if w:
-            await tmux_manager.kill_window(w.window_id)
-            logger.info(
-                "Topic closed: killed window %s (user=%d, thread=%d)",
-                display,
-                user.id,
-                thread_id,
-            )
-        else:
-            logger.info(
-                "Topic closed: window %s already gone (user=%d, thread=%d)",
-                display,
-                user.id,
-                thread_id,
-            )
-        session_manager.unbind_thread(user.id, thread_id)
-        # Clean up all memory state for this topic
-        await clear_topic_state(user.id, thread_id, context.bot, context.user_data)
-    else:
-        logger.debug(
-            "Topic closed: no binding (user=%d, thread=%d)", user.id, thread_id
-        )
-
-
-async def topic_created_handler(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    """Cache topic names from FORUM_TOPIC_CREATED service messages."""
-    msg = update.message
-    if not msg or not msg.forum_topic_created:
-        return
-    chat = update.effective_chat
-    thread_id = getattr(msg, "message_thread_id", None)
-    if chat and thread_id:
-        _topic_names[(chat.id, thread_id)] = msg.forum_topic_created.name
-        logger.debug(
-            "Cached topic name: chat=%d thread=%d name='%s'",
-            chat.id,
-            thread_id,
-            msg.forum_topic_created.name,
-        )
-
-
-async def topic_edited_handler(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    """Handle topic rename — sync new name to tmux window and internal state."""
-    user = update.effective_user
-    if not user or not is_user_allowed(user.id):
-        return
-
-    msg = update.message
-    if not msg or not msg.forum_topic_edited:
-        return
-
-    new_name = msg.forum_topic_edited.name
-    if new_name is None:
-        # Icon-only change, no rename needed
-        return
-
-    thread_id = _get_thread_id(update)
-    if thread_id is None:
-        return
-
-    # Update topic name cache
-    chat = update.effective_chat
-    if chat and thread_id:
-        _topic_names[(chat.id, thread_id)] = new_name
-
-    wid = session_manager.get_window_for_thread(user.id, thread_id)
-    if not wid:
-        logger.debug(
-            "Topic edited: no binding (user=%d, thread=%d)", user.id, thread_id
-        )
-        return
-
-    # For project groups, prefix the project name to tmux session name
-    tmux_name = new_name
-    project_name = _resolve_project_for_chat(chat)
-    if project_name:
-        tmux_name = f"{project_name}-{_sanitize_tmux_name(new_name)}"
-
-    old_name = session_manager.get_display_name(wid)
-    await tmux_manager.rename_window(wid, tmux_name)
-    session_manager.update_display_name(wid, tmux_name)
-    logger.info(
-        "Topic renamed: '%s' -> '%s' (tmux='%s', window=%s, user=%d, thread=%d)",
-        old_name,
-        new_name,
-        tmux_name,
-        wid,
-        user.id,
-        thread_id,
-    )
-
-
-async def forward_command_handler(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    """Forward any non-bot command as a slash command to the active Claude Code session."""
-    user = update.effective_user
-    if not user or not is_user_allowed(user.id):
-        return
-    if not update.message:
-        return
-
-    thread_id = _get_thread_id(update)
-
-    # Capture group chat_id for supergroup forum topic routing.
-    # Required: Telegram Bot API needs group chat_id (not user_id) to send
-    # messages with message_thread_id. Do NOT remove — see session.py docs.
-    chat = update.effective_chat
-    if chat and chat.type in ("group", "supergroup"):
-        session_manager.set_group_chat_id(user.id, thread_id, chat.id)
-
-    cmd_text = update.message.text or ""
-    # The full text is already a slash command like "/clear" or "/compact foo"
-    cc_slash = cmd_text.split("@")[0]  # strip bot mention
-    wid = session_manager.resolve_window_for_thread(user.id, thread_id)
-    if not wid:
-        await safe_reply(update.message, "❌ No session bound to this topic.")
-        return
-
-    w = await tmux_manager.find_window_by_id(wid)
-    if not w:
-        display = session_manager.get_display_name(wid)
-        await safe_reply(update.message, f"❌ Window '{display}' no longer exists.")
-        return
-
-    display = session_manager.get_display_name(wid)
-    logger.info(
-        "Forwarding command %s to window %s (user=%d)", cc_slash, display, user.id
-    )
-    await update.message.chat.send_action(ChatAction.TYPING)
-    success, message = await session_manager.send_to_window(wid, cc_slash)
-    if success:
-        await safe_reply(update.message, f"⚡ [{display}] Sent: {cc_slash}")
-        # If /clear command was sent, clear the session association
-        # so we can detect the new session after first message
-        if cc_slash.strip().lower() == "/clear":
-            logger.info("Clearing session for window %s after /clear", display)
-            session_manager.clear_window_session(wid)
-
-        # Interactive commands (e.g. /model) render a terminal-based UI
-        # with no JSONL tool_use entry.  The status poller already detects
-        # interactive UIs every 1s (status_polling.py), so no
-        # proactive detection needed here — the poller handles it.
-    else:
-        await safe_reply(update.message, f"❌ {message}")
-
-
-async def unsupported_content_handler(
-    update: Update,
-    _context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    """Reply to non-text messages (stickers, video, etc.)."""
-    if not update.message:
-        return
-    user = update.effective_user
-    if not user or not is_user_allowed(user.id):
-        return
-    logger.debug("Unsupported content from user %d", user.id)
-    await safe_reply(
-        update.message,
-        "⚠ Only text, photo, and voice messages are supported. Stickers, video, and other media cannot be forwarded to Claude Code.",
-    )
-
-
-# --- Image directory for incoming photos ---
-_IMAGES_DIR = ccbot_dir() / "images"
-_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
-
-
-async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle photos sent by the user: download and forward path to Claude Code."""
-    user = update.effective_user
-    if not user or not is_user_allowed(user.id):
-        if update.message:
-            await safe_reply(update.message, "You are not authorized to use this bot.")
-        return
-
-    if not update.message or not update.message.photo:
-        return
-
-    chat = update.message.chat
-    thread_id = _get_thread_id(update)
-    if chat.type in ("group", "supergroup") and thread_id is not None:
-        session_manager.set_group_chat_id(user.id, thread_id, chat.id)
-
-    # Must be in a named topic
-    if thread_id is None:
-        await safe_reply(
-            update.message,
-            "❌ Please use a named topic. Create a new topic to start a session.",
-        )
-        return
-
-    wid = session_manager.get_window_for_thread(user.id, thread_id)
-    if wid is None:
-        await safe_reply(
-            update.message,
-            "❌ No session bound to this topic. Send a text message first to create one.",
-        )
-        return
-
-    w = await tmux_manager.find_window_by_id(wid)
-    if not w:
-        display = session_manager.get_display_name(wid)
-        session_manager.unbind_thread(user.id, thread_id)
-        await safe_reply(
-            update.message,
-            f"❌ Window '{display}' no longer exists. Binding removed.\n"
-            "Send a message to start a new session.",
-        )
-        return
-
-    # Download the highest-resolution photo
-    photo = update.message.photo[-1]
-    tg_file = await photo.get_file()
-
-    # Save to ~/.ccbot/images/<timestamp>_<file_unique_id>.jpg
-    filename = f"{int(time.time())}_{photo.file_unique_id}.jpg"
-    file_path = _IMAGES_DIR / filename
-    await tg_file.download_to_drive(file_path)
-
-    # Build the message to send to Claude Code
-    caption = update.message.caption or ""
-    if caption:
-        text_to_send = f"{caption}\n\n(image attached: {file_path})"
-    else:
-        text_to_send = f"(image attached: {file_path})"
-
-    await update.message.chat.send_action(ChatAction.TYPING)
-    clear_status_msg_info(user.id, thread_id)
-
-    success, message = await session_manager.send_to_window(wid, text_to_send)
-    if not success:
-        await safe_reply(update.message, f"❌ {message}")
-        return
-
-    # Confirm to user
-    await safe_reply(update.message, "📷 Image sent to Claude Code.")
-
-
-async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle voice messages: transcribe via OpenAI and forward text to Claude Code."""
-    user = update.effective_user
-    if not user or not is_user_allowed(user.id):
-        if update.message:
-            await safe_reply(update.message, "You are not authorized to use this bot.")
-        return
-
-    if not update.message or not update.message.voice:
-        return
-
-    if not config.openai_api_key:
-        await safe_reply(
-            update.message,
-            "⚠ Voice transcription requires an OpenAI API key.\n"
-            "Set `OPENAI_API_KEY` in your `.env` file and restart the bot.",
-        )
-        return
-
-    chat = update.message.chat
-    thread_id = _get_thread_id(update)
-    if chat.type in ("group", "supergroup") and thread_id is not None:
-        session_manager.set_group_chat_id(user.id, thread_id, chat.id)
-
-    if thread_id is None:
-        await safe_reply(
-            update.message,
-            "❌ Please use a named topic. Create a new topic to start a session.",
-        )
-        return
-
-    wid = session_manager.get_window_for_thread(user.id, thread_id)
-    if wid is None:
-        await safe_reply(
-            update.message,
-            "❌ No session bound to this topic. Send a text message first to create one.",
-        )
-        return
-
-    w = await tmux_manager.find_window_by_id(wid)
-    if not w:
-        display = session_manager.get_display_name(wid)
-        session_manager.unbind_thread(user.id, thread_id)
-        await safe_reply(
-            update.message,
-            f"❌ Window '{display}' no longer exists. Binding removed.\n"
-            "Send a message to start a new session.",
-        )
-        return
-
-    # Download voice as in-memory bytes
-    voice_file = await update.message.voice.get_file()
-    ogg_data = bytes(await voice_file.download_as_bytearray())
-
-    # Transcribe
-    try:
-        text = await transcribe_voice(ogg_data)
-    except ValueError as e:
-        await safe_reply(update.message, f"⚠ {e}")
-        return
-    except Exception as e:
-        logger.error("Voice transcription failed: %s", e)
-        await safe_reply(update.message, f"⚠ Transcription failed: {e}")
-        return
-
-    await update.message.chat.send_action(ChatAction.TYPING)
-    clear_status_msg_info(user.id, thread_id)
-
-    success, message = await session_manager.send_to_window(wid, text)
-    if not success:
-        await safe_reply(update.message, f"❌ {message}")
-        return
-
-    await safe_reply(update.message, f'🎤 "{text}"')
-
-
-# Active bash capture tasks: (user_id, thread_id) → asyncio.Task
-_bash_capture_tasks: dict[tuple[int, int], asyncio.Task[None]] = {}
-
-
-def _cancel_bash_capture(user_id: int, thread_id: int) -> None:
-    """Cancel any running bash capture for this topic."""
-    key = (user_id, thread_id)
-    task = _bash_capture_tasks.pop(key, None)
-    if task and not task.done():
-        task.cancel()
-
-
-async def _capture_bash_output(
-    bot: Bot,
-    user_id: int,
-    thread_id: int,
-    window_id: str,
-    command: str,
-) -> None:
-    """Background task: capture ``!`` bash command output from tmux pane.
-
-    Sends the first captured output as a new message, then edits it
-    in-place as more output appears.  Stops after 30 s or when cancelled
-    (e.g. user sends a new message, which pushes content down).
-    """
-    try:
-        # Wait for the command to start producing output
-        await asyncio.sleep(2.0)
-
-        chat_id = session_manager.resolve_chat_id(user_id, thread_id)
-        msg_id: int | None = None
-        last_output: str = ""
-
-        for _ in range(30):
-            raw = await tmux_manager.capture_pane(window_id)
-            if raw is None:
-                return
-
-            output = extract_bash_output(raw, command)
-            if not output:
-                await asyncio.sleep(1.0)
-                continue
-
-            # Skip edit if nothing changed
-            if output == last_output:
-                await asyncio.sleep(1.0)
-                continue
-
-            last_output = output
-
-            # Truncate to fit Telegram's 4096-char limit
-            if len(output) > 3800:
-                output = "… " + output[-3800:]
-
-            if msg_id is None:
-                # First capture — send a new message
-                sent = await send_with_fallback(
-                    bot,
-                    chat_id,
-                    output,
-                    message_thread_id=thread_id,
-                )
-                if sent:
-                    msg_id = sent.message_id
-            else:
-                # Subsequent captures — edit in place
-                try:
-                    await bot.edit_message_text(
-                        chat_id=chat_id,
-                        message_id=msg_id,
-                        text=convert_markdown(output),
-                        parse_mode="MarkdownV2",
-                        link_preview_options=NO_LINK_PREVIEW,
-                    )
-                except Exception:
-                    try:
-                        await bot.edit_message_text(
-                            chat_id=chat_id,
-                            message_id=msg_id,
-                            text=output,
-                            link_preview_options=NO_LINK_PREVIEW,
-                        )
-                    except Exception:
-                        pass
-
-            await asyncio.sleep(1.0)
-    except asyncio.CancelledError:
-        return
-    finally:
-        _bash_capture_tasks.pop((user_id, thread_id), None)
-
-
-def _resolve_project_for_chat(chat: object) -> str | None:
-    """Resolve a project name from a Telegram chat (group) via PROJECT_GROUPS config."""
-    if chat is None:
-        return None
-    chat_id = getattr(chat, "id", None)
-    if chat_id is None:
-        return None
-    return config.project_for_group(chat_id)
-
-
-async def bind_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Bind an existing tmux session to this topic.
-
-    Lists all tmux sessions across all projects, user picks one → binds to current topic.
-    Enables 'start from terminal, continue from phone'.
-    """
-    user = update.effective_user
-    if not user or not is_user_allowed(user.id):
-        return
-    if not update.message:
-        return
-
-    thread_id = _get_thread_id(update)
-    if thread_id is None:
-        await safe_reply(update.message, "❌ This command only works in a topic.")
-        return
-
-    # Capture group chat_id
-    chat = update.effective_chat
-    if chat and chat.type in ("group", "supergroup"):
-        session_manager.set_group_chat_id(user.id, thread_id, chat.id)
-
-    # Check if already bound
-    existing_wid = session_manager.get_window_for_thread(user.id, thread_id)
-    if existing_wid:
-        display = session_manager.get_display_name(existing_wid)
-        await safe_reply(
-            update.message,
-            f"❌ This topic is already bound to `{display}`.\n"
-            "Use /unbind first to disconnect it.",
-        )
-        return
-
-    # List all tmux sessions/windows, show unbound ones
-    all_windows = await tmux_manager.list_windows()
-    bound_ids = {wid for _, _, wid in session_manager.iter_thread_bindings()}
-    unbound = [
-        (w.window_id, w.window_name, w.cwd)
-        for w in all_windows
-        if w.window_id not in bound_ids
-    ]
-
-    if not unbound:
-        await safe_reply(
-            update.message,
-            "❌ No unbound tmux sessions available.\n"
-            "Start a session from terminal with `dev go new` first.",
-        )
-        return
-
-    msg_text, keyboard, win_ids = build_window_picker(unbound)
-    if context.user_data is not None:
-        context.user_data[STATE_KEY] = STATE_SELECTING_WINDOW
-        context.user_data[UNBOUND_WINDOWS_KEY] = win_ids
-        context.user_data["_pending_thread_id"] = thread_id
-        context.user_data["_pending_thread_text"] = None  # No pending text for /bind
-    await safe_reply(update.message, msg_text, reply_markup=keyboard)
-
-
-async def mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Switch Claude Code permission mode for the session bound to this topic."""
-    user = update.effective_user
-    if not user or not is_user_allowed(user.id):
-        return
-    if not update.message:
-        return
-
-    thread_id = _get_thread_id(update)
-    wid = session_manager.resolve_window_for_thread(user.id, thread_id)
-    if not wid:
-        await safe_reply(update.message, "❌ No session bound to this topic.")
-        return
-
-    # Parse argument
-    text = update.message.text or ""
-    parts = text.strip().split(maxsplit=1)
-    if len(parts) < 2:
-        # Show current options
-        keyboard = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton("Auto", callback_data=f"mode:auto:{wid}"),
-                    InlineKeyboardButton(
-                        "Accept edits", callback_data=f"mode:edit:{wid}"
-                    ),
-                ],
-                [
-                    InlineKeyboardButton("Plan", callback_data=f"mode:plan:{wid}"),
-                    InlineKeyboardButton(
-                        "Approve all", callback_data=f"mode:approve:{wid}"
-                    ),
-                ],
-            ]
-        )
-        await safe_reply(
-            update.message, "Select permission mode:", reply_markup=keyboard
-        )
-        return
-
-    mode_arg = parts[1].lower().strip()
-    mode_flags = {
-        "auto": "--dangerously-skip-permissions",
-        "edit": "--allowedTools Edit,Write,NotebookEdit",
-        "plan": "--allowedTools ''",
-        "approve": "",
-    }
-    if mode_arg not in mode_flags:
-        await safe_reply(
-            update.message,
-            f"❌ Unknown mode `{mode_arg}`.\nValid: auto, edit, plan, approve",
-        )
-        return
-
-    await safe_reply(
-        update.message,
-        f"⚠ Mode switching requires restarting Claude.\n"
-        f"Use `/esc` to exit current session, then start a new topic with mode `{mode_arg}`.",
-    )
-
-
-def _parse_github_url(remote_url: str) -> str | None:
-    """Parse a GitHub HTTPS URL from a git remote URL. Returns None for non-GitHub."""
-    import re as _re
-
-    # HTTPS: https://github.com/owner/repo.git
-    m = _re.match(r"https://github\.com/([^/]+/[^/]+?)(?:\.git)?$", remote_url)
-    if m:
-        return f"https://github.com/{m.group(1)}"
-    # SSH: git@github.com:owner/repo.git
-    m = _re.match(r"git@github\.com:([^/]+/[^/]+?)(?:\.git)?$", remote_url)
-    if m:
-        return f"https://github.com/{m.group(1)}"
-    return None
-
-
-def _make_github_link(
-    base_url: str, file_path: str, branch: str, heading: str | None = None
-) -> str:
-    """Build a GitHub blob link, optionally with a header anchor."""
-    url = f"{base_url}/blob/{branch}/{file_path}"
-    if heading:
-        # GitHub anchor format: lowercase, spaces→hyphens, strip non-alphanumeric
-        anchor = re.sub(r"[^\w\s-]", "", heading.lower())
-        anchor = re.sub(r"\s+", "-", anchor.strip())
-        url = f"{url}#{anchor}"
-    return url
-
-
-def _inject_github_links(text: str, work_dir: str) -> str:
-    """Post-process text to append GitHub links for referenced file paths.
-
-    Scans for file paths relative to the work_dir and appends clickable
-    GitHub links. Only processes .md files and common code files.
-    """
-    try:
-        remote_url = subprocess.run(
-            ["git", "-C", work_dir, "remote", "get-url", "origin"],
-            capture_output=True, text=True, timeout=5,
-        ).stdout.strip()
-    except Exception:
-        return text
-
-    base_url = _parse_github_url(remote_url)
-    if not base_url:
-        return text
-
-    work_path = Path(work_dir).resolve()
-
-    # Find file paths in the text (patterns like path/to/file.ext or /abs/path/to/file.ext)
-    path_pattern = re.compile(
-        r'(?:^|[\s`(])(/[\w./-]+\.(?:md|py|ts|js|yml|yaml|json|toml))\b'
-        r'|(?:^|[\s`(])([\w][\w./-]+\.(?:md|py|ts|js|yml|yaml|json|toml))\b',
-        re.MULTILINE,
-    )
-
-    replacements: list[tuple[str, str]] = []
-    for m in path_pattern.finditer(text):
-        file_ref = m.group(1) or m.group(2)
-        if not file_ref:
-            continue
-
-        # Resolve to absolute, then make relative to work_dir
-        if file_ref.startswith("/"):
-            abs_path = Path(file_ref)
-        else:
-            abs_path = work_path / file_ref
-
-        try:
-            abs_path = abs_path.resolve()
-            if not abs_path.is_file():
-                continue
-            rel_path = abs_path.relative_to(work_path)
-        except (ValueError, OSError):
-            continue
-
-        link = _make_github_link(base_url, str(rel_path), "main")
-        link_text = f"[{rel_path}]({link})"
-        # Only replace if not already a markdown link
-        if f"]({link}" not in text:
-            replacements.append((file_ref, link_text))
-
-    # Apply replacements (longest first to avoid partial matches)
-    for old, new in sorted(replacements, key=lambda x: -len(x[0])):
-        text = text.replace(old, new, 1)
-
-    return text
-
-
-def _resolve_conversational_dir(project_name: str) -> str:
-    """Find the directory for a conversational session.
-
-    Uses the main branch worktree if the project has one, otherwise the project dir.
-    """
-    project_dir = config.project_dir(project_name)
-    main_worktree = project_dir / f"{project_name}-main"
-    if main_worktree.is_dir():
-        return str(main_worktree)
-    return str(project_dir)
-
-
-async def _handle_plan_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    user_id: int,
-    chat_id: int,
-    thread_id: int | None,
-    window_id: str,
-    arg: str,
-) -> None:
-    """Handle $plan — instruct Claude to enter planning mode."""
-    assert update.message is not None
-    prompt = (
-        "Enter plan mode. The user wants to plan changes to the codebase. "
-        "Explore the codebase, research what's needed, and produce a structured plan. "
-        "Use back-and-forth questions to clarify requirements before finalizing."
-    )
-    if arg:
-        prompt = f"{prompt}\n\nContext: {arg}"
-
-    first_name = getattr(
-        update.effective_user, "first_name", "User"
-    )
-    prefixed = f"[{first_name}] {prompt}"
-    success, msg = await session_manager.send_to_window(window_id, prefixed)
-    if not success:
-        await safe_reply(update.message, f"❌ {msg}")
-
-
-async def _handle_accept_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    user_id: int,
-    chat_id: int,
-    thread_id: int | None,
-    window_id: str,
-    arg: str,
-) -> None:
-    """Handle $accept — extract plan, create worktree, spawn dev session.
-
-    Only DEV_USERS can accept plans.
-    """
-    assert update.message is not None
-
-    if not config.is_dev_user(user_id):
-        await safe_reply(update.message, "❌ Only dev users can accept plans.")
-        return
-
-    project_name = config.project_for_group(chat_id)
-    if not project_name:
-        await safe_reply(update.message, "❌ No project mapped to this group.")
-        return
-
-    # Determine plan name from arg or ask Claude to summarize
-    plan_name = arg.strip() if arg.strip() else None
-    if not plan_name:
-        await safe_reply(
-            update.message,
-            "Usage: `$accept <plan-name>`\nExample: `$accept add-login-page`",
-        )
-        return
-
-    plan_slug = _sanitize_tmux_name(plan_name)
-    worktree_name = f"{project_name}-{plan_slug}-ws"
-
-    # Create worktree from bare repo
-    project_dir = config.project_dir(project_name)
-    bare_repo = project_dir / f"{project_name}.git"
-    worktree_path = project_dir / worktree_name
-
-    if not bare_repo.is_dir():
-        await safe_reply(
-            update.message,
-            f"❌ Project not set up for worktrees (missing {bare_repo}).",
-        )
-        return
-
-    if worktree_path.exists():
-        await safe_reply(
-            update.message,
-            f"❌ Worktree `{worktree_name}` already exists.",
-        )
-        return
-
-    await safe_reply(update.message, f"Creating worktree `{worktree_name}`...")
-
-    try:
-        # Create branch and worktree
-        subprocess.run(
-            ["git", "-C", str(bare_repo), "worktree", "add",
-             str(worktree_path), "-b", worktree_name],
-            check=True, capture_output=True, text=True,
-        )
-    except subprocess.CalledProcessError as e:
-        await safe_reply(update.message, f"❌ Failed to create worktree: {e.stderr}")
-        return
-
-    # Update pool file
-    pool_file = project_dir / ".workspace-pool.yml"
-    if pool_file.exists():
-        try:
-            pool_data = yaml.safe_load(pool_file.read_text()) or {}
-            if "worktrees" not in pool_data:
-                pool_data["worktrees"] = {}
-            pool_data["worktrees"][worktree_name] = {
-                "status": "reserved",
-                "branch": worktree_name,
-                "agent": "claude",
-                "epic": plan_name,
-                "reserved_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            }
-            pool_file.write_text(yaml.dump(pool_data, default_flow_style=False))
-        except Exception as e:
-            logger.warning("Failed to update pool file: %s", e)
-
-    # Ask conversational Claude to write the plan to the worktree
-    plan_prompt = (
-        f"Write a structured implementation plan to {worktree_path}/.claude/plans/{plan_slug}.md — "
-        f"include epic, stories, tasks, and all research context from our conversation. "
-        f"This plan will be used by a new Claude session to implement the changes."
-    )
-    await session_manager.send_to_window(window_id, plan_prompt)
-
-    # Spawn dev session in the worktree
-    success, message, created_name, created_wid = await tmux_manager.create_window(
-        str(worktree_path), window_name=worktree_name
-    )
-    if not success:
-        await safe_reply(update.message, f"❌ Failed to create dev session: {message}")
-        return
-
-    await session_manager.wait_for_session_map_entry(created_wid, timeout=5.0)
-
-    # Create dev topic in dev group
-    dev_chat_id = config.dev_group
-    if dev_chat_id:
-        try:
-            forum_topic = await context.bot.create_forum_topic(
-                chat_id=dev_chat_id, name=worktree_name,
-            )
-            new_thread_id = forum_topic.message_thread_id
-            for uid in config.dev_users:
-                session_manager.set_group_chat_id(uid, new_thread_id, dev_chat_id)
-                session_manager.bind_thread(
-                    uid, new_thread_id, created_wid, window_name=created_name,
-                )
-            _topic_names[(dev_chat_id, new_thread_id)] = worktree_name
-            _worktree_sources[worktree_name] = (chat_id, thread_id)
-
-            # Notify conversational topic with link
-            link_chat_id = str(dev_chat_id).replace("-100", "")
-            topic_link = f"https://t.me/c/{link_chat_id}/{new_thread_id}"
-            await safe_reply(
-                update.message,
-                f"Plan accepted. Work session created: [{worktree_name}]({topic_link})",
-            )
-        except Exception as e:
-            logger.error("Failed to create dev topic for accepted plan: %s", e)
-            await safe_reply(
-                update.message,
-                f"Worktree created at `{worktree_path}`, but failed to create dev topic: {e}",
-            )
-    else:
-        await safe_reply(
-            update.message,
-            f"Worktree created at `{worktree_path}`. No dev group configured.",
-        )
-
-
-async def _handle_new_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    user_id: int,
-    chat_id: int,
-    thread_id: int | None,
-    window_id: str,
-    arg: str,
-) -> None:
-    """Handle $new — create a new conversational topic, carrying context."""
-    assert update.message is not None
-
-    topic_title = arg.strip() if arg.strip() else "New conversation"
-
-    try:
-        forum_topic = await context.bot.create_forum_topic(
-            chat_id=chat_id, name=topic_title,
-        )
-        new_thread_id = forum_topic.message_thread_id
-    except Exception as e:
-        await safe_reply(update.message, f"❌ Failed to create topic: {e}")
-        return
-
-    _topic_names[(chat_id, new_thread_id)] = topic_title
-
-    # Create a new conversational session for the new topic
-    project_name = config.project_for_group(chat_id)
-    if project_name:
-        work_dir = _resolve_conversational_dir(project_name)
-        tmux_name = f"{project_name}-{_sanitize_tmux_name(topic_title)}"
-
-        success, message, created_name, created_wid = (
-            await tmux_manager.create_window(
-                work_dir, window_name=tmux_name, skip_permissions=True
-            )
-        )
-        if success:
-            await session_manager.wait_for_session_map_entry(created_wid, timeout=5.0)
-            session_manager.bind_topic(
-                chat_id, new_thread_id, created_wid,
-                topic_type="conversational", window_name=created_name,
-            )
-
-            # Carry context: ask the old session to summarize for the new one
-            summary_prompt = (
-                f"Summarize the current conversation context concisely — "
-                f"the user is moving to a new topic '{topic_title}'. "
-                f"Output only the summary, nothing else."
-            )
-            await session_manager.send_to_window(window_id, summary_prompt)
-
-    # Reply with link to new topic
-    link_chat_id = str(chat_id).replace("-100", "")
-    topic_link = f"https://t.me/c/{link_chat_id}/{new_thread_id}"
-    await safe_reply(
-        update.message,
-        f"Created [{topic_title}]({topic_link})",
-    )
-
-
-async def _handle_merge_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    user_id: int,
-    chat_id: int,
-    thread_id: int | None,
-    window_id: str,
-    arg: str,
-) -> None:
-    """Handle $merge — merge a worktree branch to main and release it.
-
-    Only DEV_USERS can merge.
-    """
-    assert update.message is not None
-
-    if not config.is_dev_user(user_id):
-        await safe_reply(update.message, "❌ Only dev users can merge.")
-        return
-
-    project_name = config.project_for_group(chat_id)
-    if not project_name:
-        await safe_reply(update.message, "❌ No project mapped to this group.")
-        return
-
-    worktree_name = arg.strip() if arg.strip() else None
-    if not worktree_name:
-        await safe_reply(
-            update.message,
-            "Usage: `$merge <worktree-name>`\nExample: `$merge france-2026-add-login-ws`",
-        )
-        return
-
-    project_dir = config.project_dir(project_name)
-    bare_repo = project_dir / f"{project_name}.git"
-    worktree_path = project_dir / worktree_name
-
-    if not worktree_path.is_dir():
-        await safe_reply(update.message, f"❌ Worktree `{worktree_name}` not found.")
-        return
-
-    # Get default branch from pool file
-    pool_file = project_dir / ".workspace-pool.yml"
-    default_branch = "main"
-    if pool_file.exists():
-        try:
-            pool_data = yaml.safe_load(pool_file.read_text()) or {}
-            default_branch = pool_data.get("default_branch", "main")
-        except Exception:
-            pass
-
-    try:
-        # Merge worktree branch into default branch
-        subprocess.run(
-            ["git", "-C", str(bare_repo), "checkout", default_branch],
-            check=True, capture_output=True, text=True,
-        )
-        subprocess.run(
-            ["git", "-C", str(bare_repo), "merge", "--no-ff", worktree_name,
-             "-m", f"Merge {worktree_name} into {default_branch}"],
-            check=True, capture_output=True, text=True,
-        )
-
-        # Remove worktree
-        subprocess.run(
-            ["git", "-C", str(bare_repo), "worktree", "remove", str(worktree_path)],
-            check=True, capture_output=True, text=True,
-        )
-
-        # Delete the branch
-        subprocess.run(
-            ["git", "-C", str(bare_repo), "branch", "-d", worktree_name],
-            check=True, capture_output=True, text=True,
-        )
-
-        # Update pool file
-        if pool_file.exists():
-            try:
-                pool_data = yaml.safe_load(pool_file.read_text()) or {}
-                if "worktrees" in pool_data:
-                    pool_data["worktrees"].pop(worktree_name, None)
-                pool_file.write_text(yaml.dump(pool_data, default_flow_style=False))
-            except Exception as e:
-                logger.warning("Failed to update pool file: %s", e)
-
-        # Update main worktree
-        main_worktree = project_dir / f"{project_name}-main"
-        if main_worktree.is_dir():
-            subprocess.run(
-                ["git", "-C", str(main_worktree), "pull", "--ff-only"],
-                capture_output=True, text=True,
-            )
-
-        await safe_reply(
-            update.message,
-            f"Merged `{worktree_name}` into `{default_branch}` and released worktree.",
-        )
-
-        # Trigger retrospective in the conversational session
-        retro_prompt = (
-            f"The worktree `{worktree_name}` has been merged to `{default_branch}`. "
-            f"Run a retrospective following the guide in docs/retrospective.md. "
-            f"Use /session-explorer to find the sessions that worked in this worktree, "
-            f"reconstruct the timeline, and produce a retrospective document. "
-            f"Write the output to work/retrospectives/{worktree_name}.md"
-        )
-        await session_manager.send_to_window(window_id, retro_prompt)
-
-    except subprocess.CalledProcessError as e:
-        await safe_reply(
-            update.message, f"❌ Merge failed: {e.stderr or e.stdout}"
-        )
-
-
-async def _handle_conversational_message(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    user: object,
-    chat_id: int,
-    thread_id: int | None,
-    text: str,
-) -> None:
-    """Handle a message in a conversational topic (or General).
-
-    Creates a Claude Code session if the topic isn't bound yet, then forwards
-    the message with the sender's name prefix.
-    """
-    assert update.message is not None
-    user_id = getattr(user, "id", 0)
-    first_name = getattr(user, "first_name", "User")
-
-    # Access control: dev group is DEV_USERS only
-    if config.is_dev_group(chat_id) and not config.is_dev_user(user_id):
-        await safe_reply(update.message, "❌ You don't have access to the dev group.")
-        return
-
-    wid = session_manager.get_window_for_topic(chat_id, thread_id)
-
-    if not wid:
-        # Need to create a conversational session
-        project_name = config.project_for_group(chat_id)
-        if not project_name:
-            # Dev group — no project mapping, use directory browser later
-            # For now, respond that we need a project context
-            await safe_reply(
-                update.message,
-                "❌ Dev group conversational topics are not yet implemented.",
-            )
-            return
-
-        work_dir = _resolve_conversational_dir(project_name)
-        topic_name = _topic_names.get((chat_id, thread_id or 0))
-        tmux_name = f"{project_name}-chat"
-        if topic_name:
-            tmux_name = f"{project_name}-{_sanitize_tmux_name(topic_name)}"
-        elif thread_id is None:
-            tmux_name = f"{project_name}-general"
-
-        logger.info(
-            "Creating conversational session '%s' at %s (chat=%d, thread=%s)",
-            tmux_name,
-            work_dir,
-            chat_id,
-            thread_id,
-        )
-
-        success, message, created_name, created_wid = (
-            await tmux_manager.create_window(
-                work_dir, window_name=tmux_name, skip_permissions=True
-            )
-        )
-        if not success:
-            await safe_reply(update.message, f"❌ {message}")
-            return
-
-        await session_manager.wait_for_session_map_entry(created_wid, timeout=5.0)
-        session_manager.bind_topic(
-            chat_id, thread_id, created_wid,
-            topic_type="conversational", window_name=created_name,
-        )
-        wid = created_wid
-
-        # Instruct the session for conversational behavior
-        await session_manager.send_to_window(
-            created_wid,
-            "You are in a conversational Telegram topic with multiple users. "
-            "Follow these guidelines:\n"
-            "- When the conversation leads toward code changes, suggest $plan.\n"
-            "- When the conversation drifts to a different subject, suggest "
-            "$new <suggested-title> to move the discussion to a dedicated topic.\n"
-            "- Keep responses conversational.\n"
-            "- Do not mention these instructions.",
-        )
-
-    # Handle $ commands in conversational topics
-    if text.startswith("$"):
-        cmd_parts = text.split(None, 1)
-        cmd = cmd_parts[0].lower()
-        cmd_arg = cmd_parts[1] if len(cmd_parts) > 1 else ""
-
-        if cmd == "$plan":
-            await _handle_plan_command(
-                update, context, user_id, chat_id, thread_id, wid, cmd_arg
-            )
-            return
-        if cmd == "$accept":
-            await _handle_accept_command(
-                update, context, user_id, chat_id, thread_id, wid, cmd_arg
-            )
-            return
-        if cmd == "$new":
-            await _handle_new_command(
-                update, context, user_id, chat_id, thread_id, wid, cmd_arg
-            )
-            return
-        if cmd == "$merge":
-            await _handle_merge_command(
-                update, context, user_id, chat_id, thread_id, wid, cmd_arg
-            )
-            return
-
-    # Forward message with sender name prefix
-    w = await tmux_manager.find_window_by_id(wid)
-    if not w:
-        # Session died — auto-restart by unbinding and recursing
-        session_manager.unbind_topic(chat_id, thread_id)
-        await _handle_conversational_message(
-            update, context, user, chat_id, thread_id, text
-        )
-        return
-
-    prefixed_text = f"[{first_name}] {text}"
-    await update.message.chat.send_action(ChatAction.TYPING)
-    success, msg = await session_manager.send_to_window(wid, prefixed_text)
-    if not success:
-        await safe_reply(update.message, f"❌ {msg}")
-
-
-async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    if not user or not is_user_allowed(user.id):
-        if update.message:
-            await safe_reply(update.message, "You are not authorized to use this bot.")
-        return
-
-    if not update.message or not update.message.text:
-        return
-
-    thread_id = _get_thread_id(update)
-
-    # Capture group chat_id for supergroup forum topic routing.
-    # Required: Telegram Bot API needs group chat_id (not user_id) to send
-    # messages with message_thread_id. Do NOT remove — see session.py docs.
-    chat = update.effective_chat
-    if chat and chat.type in ("group", "supergroup"):
-        session_manager.set_group_chat_id(user.id, thread_id, chat.id)
-
-    text = update.message.text
-
-    # Ignore text in window picker mode (only for the same thread)
-    if context.user_data and context.user_data.get(STATE_KEY) == STATE_SELECTING_WINDOW:
-        pending_tid = context.user_data.get("_pending_thread_id")
-        if pending_tid == thread_id:
-            await safe_reply(
-                update.message,
-                "Please use the window picker above, or tap Cancel.",
-            )
-            return
-        # Stale picker state from a different thread — clear it
-        clear_window_picker_state(context.user_data)
-        context.user_data.pop("_pending_thread_id", None)
-        context.user_data.pop("_pending_thread_text", None)
-
-    # Ignore text in directory browsing mode (only for the same thread)
-    if (
-        context.user_data
-        and context.user_data.get(STATE_KEY) == STATE_BROWSING_DIRECTORY
-    ):
-        pending_tid = context.user_data.get("_pending_thread_id")
-        if pending_tid == thread_id:
-            await safe_reply(
-                update.message,
-                "Please use the directory browser above, or tap Cancel.",
-            )
-            return
-        # Stale browsing state from a different thread — clear it
-        clear_browse_state(context.user_data)
-        context.user_data.pop("_pending_thread_id", None)
-        context.user_data.pop("_pending_thread_text", None)
-
-    # Ignore text in session picker mode (only for the same thread)
-    if (
-        context.user_data
-        and context.user_data.get(STATE_KEY) == STATE_SELECTING_SESSION
-    ):
-        pending_tid = context.user_data.get("_pending_thread_id")
-        if pending_tid == thread_id:
-            await safe_reply(
-                update.message,
-                "Please use the session picker above, or tap Cancel.",
-            )
-            return
-        # Stale picker state from a different thread — clear it
-        clear_session_picker_state(context.user_data)
-        context.user_data.pop("_pending_thread_id", None)
-        context.user_data.pop("_pending_thread_text", None)
-        context.user_data.pop("_selected_path", None)
-
-    # General topic (thread_id is None) or any topic in a managed group
-    chat_id = chat.id if chat else None
-
-    if thread_id is None:
-        # General topic
-        if chat_id and (
-            config.is_conversational_group(chat_id) or config.is_dev_group(chat_id)
-        ):
-            # Conversational session in General — route through topic_bindings
-            await _handle_conversational_message(
-                update, context, user, chat_id, None, text
-            )
-            return
-
-        # Not a managed group — reject
-        await safe_reply(
-            update.message,
-            "❌ Please use a named topic. Create a new topic to start a session.",
-        )
-        return
-
-    # Check topic_bindings first (conversational topics)
-    wid = None
-    if chat_id:
-        wid = session_manager.get_window_for_topic(chat_id, thread_id)
-    if wid:
-        # Conversational topic — route through shared session
-        await _handle_conversational_message(
-            update, context, user, chat_id, thread_id, text  # type: ignore[arg-type]
-        )
-        return
-
-    wid = session_manager.get_window_for_thread(user.id, thread_id)
-    if wid is None:
-        # Unbound topic — check if this is a conversational or dev group
-        if chat_id and (
-            config.is_conversational_group(chat_id) or config.is_dev_group(chat_id)
-        ):
-            # User-created topic in managed group → conversational topic
-            await _handle_conversational_message(
-                update, context, user, chat_id, thread_id, text  # type: ignore[arg-type]
-            )
-            return
-
-        # Not a managed group — fall back to window picker / directory browser
-        all_windows = await tmux_manager.list_windows()
-        bound_ids = {wid for _, _, wid in session_manager.iter_thread_bindings()}
-        unbound = [
-            (w.window_id, w.session_name or w.window_name, w.cwd)
-            for w in all_windows
-            if w.window_id not in bound_ids
-        ]
-        logger.debug(
-            "Window picker check: all=%s, bound=%s, unbound=%s",
-            [w.window_name for w in all_windows],
-            bound_ids,
-            [name for _, name, _ in unbound],
-        )
-
-        if unbound:
-            # Show window picker
-            logger.info(
-                "Unbound topic: showing window picker (%d unbound windows, user=%d, thread=%d)",
-                len(unbound),
-                user.id,
-                thread_id,
-            )
-            msg_text, keyboard, win_ids = build_window_picker(unbound)
-            if context.user_data is not None:
-                context.user_data[STATE_KEY] = STATE_SELECTING_WINDOW
-                context.user_data[UNBOUND_WINDOWS_KEY] = win_ids
-                context.user_data["_pending_thread_id"] = thread_id
-                context.user_data["_pending_thread_text"] = text
-            await safe_reply(update.message, msg_text, reply_markup=keyboard)
-            return
-
-        # No unbound windows — show directory browser to create a new session
-        logger.info(
-            "Unbound topic: showing directory browser (user=%d, thread=%d)",
-            user.id,
-            thread_id,
-        )
-        start_path = str(Path.cwd())
-        msg_text, keyboard, subdirs = build_directory_browser(start_path)
-        if context.user_data is not None:
-            context.user_data[STATE_KEY] = STATE_BROWSING_DIRECTORY
-            context.user_data[BROWSE_PATH_KEY] = start_path
-            context.user_data[BROWSE_PAGE_KEY] = 0
-            context.user_data[BROWSE_DIRS_KEY] = subdirs
-            context.user_data["_pending_thread_id"] = thread_id
-            context.user_data["_pending_thread_text"] = text
-        await safe_reply(update.message, msg_text, reply_markup=keyboard)
-        return
-
-    # Bound topic — forward to bound window
-    w = await tmux_manager.find_window_by_id(wid)
-    if not w:
-        display = session_manager.get_display_name(wid)
-        logger.info(
-            "Stale binding: window %s gone, unbinding (user=%d, thread=%d)",
-            display,
-            user.id,
-            thread_id,
-        )
-        session_manager.unbind_thread(user.id, thread_id)
-        await safe_reply(
-            update.message,
-            f"❌ Window '{display}' no longer exists. Binding removed.\n"
-            "Send a message to start a new session.",
-        )
-        return
-
-    await update.message.chat.send_action(ChatAction.TYPING)
-    await enqueue_status_update(context.bot, user.id, wid, None, thread_id=thread_id)
-
-    # Cancel any running bash capture — new message pushes pane content down
-    _cancel_bash_capture(user.id, thread_id)
-
-    # Check for pending interactive UI before sending text.
-    # This catches UIs (permission prompts, etc.) that status polling might have missed.
-    pane_text = await tmux_manager.capture_pane(w.window_id)
-    if pane_text and is_interactive_ui(pane_text):
-        # UI detected — show it to user, then send text (acts as Enter)
-        logger.info(
-            "Detected pending interactive UI before sending text (user=%d, thread=%s)",
-            user.id,
-            thread_id,
-        )
-        await handle_interactive_ui(context.bot, user.id, wid, thread_id)
-        # Small delay to let UI render in Telegram before text arrives
-        await asyncio.sleep(0.3)
-
-    success, message = await session_manager.send_to_window(wid, text)
-    if not success:
-        await safe_reply(update.message, f"❌ {message}")
-        return
-
-    # Start background capture for ! bash command output
-    if text.startswith("!") and len(text) > 1:
-        bash_cmd = text[1:]  # strip leading "!"
-        task = asyncio.create_task(
-            _capture_bash_output(context.bot, user.id, thread_id, wid, bash_cmd)
-        )
-        _bash_capture_tasks[(user.id, thread_id)] = task
-
-    # If in interactive mode, refresh the UI after sending text
-    interactive_window = get_interactive_window(user.id, thread_id)
-    if interactive_window and interactive_window == wid:
-        await asyncio.sleep(0.2)
-        await handle_interactive_ui(context.bot, user.id, wid, thread_id)
-
-
-# --- Window creation helper ---
+# --- Window creation helper (used by callback_handler) ---
 
 
 async def _create_and_bind_window(
@@ -1837,7 +252,7 @@ async def _create_and_bind_window(
         if resume_session_id:
             ws = session_manager.get_window_state(created_wid)
             if not hook_ok:
-                # Hook timed out — manually populate window_state so the
+                # Hook timed out -- manually populate window_state so the
                 # monitor can still route messages back to this topic.
                 logger.warning(
                     "Hook timed out for resume window %s, "
@@ -1866,7 +281,7 @@ async def _create_and_bind_window(
                 user.id, pending_thread_id, created_wid, window_name=created_wname
             )
 
-            # Do NOT rename the Telegram topic — preserve user's chosen name
+            # Do NOT rename the Telegram topic -- preserve user's chosen name
             resolved_chat = session_manager.resolve_chat_id(user.id, pending_thread_id)
 
             status = "Resumed" if resume_session_id else "Created"
@@ -1938,7 +353,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     # Capture group chat_id for supergroup forum topic routing.
     # Required: Telegram Bot API needs group chat_id (not user_id) to send
-    # messages with message_thread_id. Do NOT remove — see session.py docs.
+    # messages with message_thread_id. Do NOT remove -- see session.py docs.
     cb_thread_id = _get_thread_id(update)
     chat = update.effective_chat
     if chat and chat.type in ("group", "supergroup"):
@@ -1975,8 +390,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 edit=True,
                 start_byte=start_byte,
                 end_byte=end_byte,
-                # Don't pass user_id for pagination - offset update only on initial view
-                # This prevents offset from going backwards if new messages arrive while paging
             )
         else:
             await safe_edit(query, "Window no longer exists.")
@@ -2114,7 +527,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         # Check for existing sessions in this directory
         sessions = await session_manager.list_sessions_for_directory(selected_path)
         if sessions:
-            # Show session picker — store state for later
+            # Show session picker -- store state for later
             if context.user_data is not None:
                 context.user_data[STATE_KEY] = STATE_SELECTING_SESSION
                 context.user_data[SESSIONS_KEY] = sessions
@@ -2124,7 +537,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer()
             return
 
-        # No existing sessions — create new window directly
+        # No existing sessions -- create new window directly
         await _create_and_bind_window(
             query, context, user, selected_path, pending_thread_id
         )
@@ -2299,7 +712,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 )
         await query.answer("Bound")
 
-    # Window picker: new session → transition to directory browser
+    # Window picker: new session -> transition to directory browser
     elif data == CB_WIN_NEW:
         pending_tid = (
             context.user_data.get("_pending_thread_id") if context.user_data else None
@@ -2567,293 +980,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 pass  # Screenshot unchanged or message too old
 
 
-# --- Streaming response / notifications ---
-
-
-async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
-    """Handle a new assistant message — enqueue for sequential processing.
-
-    Messages are queued per-user to ensure status messages always appear last.
-    Routes via thread_bindings to deliver to the correct topic.
-    """
-    status = "complete" if msg.is_complete else "streaming"
-    logger.info(
-        f"handle_new_message [{status}]: session={msg.session_id}, "
-        f"text_len={len(msg.text)}"
-    )
-
-    # Check topic_bindings first (conversational topics — deliver to topic, not per-user)
-    active_topics = await session_manager.find_topics_for_session(msg.session_id)
-    if active_topics and msg.is_complete:
-        # Post-process text with GitHub links for conversational topics
-        processed_text = msg.text
-        if msg.content_type == "text" and msg.role == "assistant":
-            for _, _, wid in active_topics:
-                ws = session_manager.get_window_state(wid)
-                if ws.cwd:
-                    processed_text = _inject_github_links(processed_text, ws.cwd)
-                    break
-
-        parts = build_response_parts(
-            processed_text, msg.is_complete, msg.content_type, msg.role,
-        )
-        for topic_chat_id, topic_thread_id, wid in active_topics:
-            # Use a synthetic user_id for the queue (negative chat_id as key)
-            queue_user_id = topic_chat_id  # use chat_id as queue key
-            await enqueue_content_message(
-                bot=bot,
-                user_id=queue_user_id,
-                window_id=wid,
-                parts=parts,
-                tool_use_id=msg.tool_use_id,
-                content_type=msg.content_type,
-                text=msg.text,
-                thread_id=topic_thread_id,
-                image_data=msg.image_data,
-            )
-        return
-
-    # Find users whose thread-bound window matches this session (dev topics)
-    active_users = await session_manager.find_users_for_session(msg.session_id)
-
-    if not active_users and not active_topics:
-        logger.info(f"No active users for session {msg.session_id}")
-        return
-
-    for user_id, wid, thread_id in active_users:
-        # Handle interactive tools specially - capture terminal and send UI
-        if msg.tool_name in INTERACTIVE_TOOL_NAMES and msg.content_type == "tool_use":
-            # Mark interactive mode BEFORE sleeping so polling skips this window
-            set_interactive_mode(user_id, wid, thread_id)
-            # Flush pending messages (e.g. plan content) before sending interactive UI
-            queue = get_message_queue(user_id)
-            if queue:
-                await queue.join()
-            # Wait briefly for Claude Code to render the question UI
-            await asyncio.sleep(0.3)
-            handled = await handle_interactive_ui(bot, user_id, wid, thread_id)
-            if handled:
-                # Update user's read offset
-                session = await session_manager.resolve_session_for_window(wid)
-                if session and session.file_path:
-                    try:
-                        file_size = Path(session.file_path).stat().st_size
-                        session_manager.update_user_window_offset(
-                            user_id, wid, file_size
-                        )
-                    except OSError:
-                        pass
-                continue  # Don't send the normal tool_use message
-            else:
-                # UI not rendered — clear the early-set mode
-                clear_interactive_mode(user_id, thread_id)
-
-        # Any non-interactive message means the interaction is complete — delete the UI message
-        if get_interactive_msg_id(user_id, thread_id):
-            await clear_interactive_msg(user_id, bot, thread_id)
-
-        parts = build_response_parts(
-            msg.text,
-            msg.is_complete,
-            msg.content_type,
-            msg.role,
-        )
-
-        if msg.is_complete:
-            # Enqueue content message task
-            # Note: tool_result editing is handled inside _process_content_task
-            # to ensure sequential processing with tool_use message sending
-            await enqueue_content_message(
-                bot=bot,
-                user_id=user_id,
-                window_id=wid,
-                parts=parts,
-                tool_use_id=msg.tool_use_id,
-                content_type=msg.content_type,
-                text=msg.text,
-                thread_id=thread_id,
-                image_data=msg.image_data,
-            )
-
-            # Update user's read offset to current file position
-            # This marks these messages as "read" for this user
-            session = await session_manager.resolve_session_for_window(wid)
-            if session and session.file_path:
-                try:
-                    file_size = Path(session.file_path).stat().st_size
-                    session_manager.update_user_window_offset(user_id, wid, file_size)
-                except OSError:
-                    pass
-
-
-async def handle_new_session(session: NewSession, bot: Bot) -> None:
-    """Auto-create a Telegram topic for a new session in the dev group.
-
-    Phase 3: bidirectional tmux ↔ dev topic sync. For now, creates dev topics
-    in the dev group for new tmux sessions. Conversational groups are skipped.
-    """
-    # Check if this window is already bound (thread_bindings or topic_bindings)
-    for _, _, bound_wid in session_manager.iter_thread_bindings():
-        if bound_wid == session.window_id:
-            return
-    for _, _, bound_wid in session_manager.iter_topic_bindings():
-        if bound_wid == session.window_id:
-            return
-
-    # Dev group sync: create a dev topic for this tmux session
-    chat_id = config.dev_group
-    if not chat_id:
-        return
-
-    # Derive topic name from tmux session name
-    topic_title = session.tmux_session_name or session.window_name
-    if not topic_title:
-        topic_title = "New session"
-
-    logger.info(
-        "Auto-creating dev topic '%s' for session %s (chat=%d)",
-        topic_title,
-        session.window_id,
-        chat_id,
-    )
-
-    try:
-        forum_topic = await bot.create_forum_topic(chat_id=chat_id, name=topic_title)
-        new_thread_id = forum_topic.message_thread_id
-    except Exception as e:
-        logger.error(
-            "Failed to auto-create topic for session %s: %s", session.window_id, e
-        )
-        return
-
-    # Bind for DEV_USERS only (dev group is Sam-only)
-    for user_id in config.dev_users:
-        session_manager.set_group_chat_id(user_id, new_thread_id, chat_id)
-        session_manager.bind_thread(
-            user_id,
-            new_thread_id,
-            session.window_id,
-            window_name=session.window_name,
-        )
-
-    _topic_names[(chat_id, new_thread_id)] = topic_title
-    logger.info(
-        "Auto-created dev topic '%s' (thread=%d) for session %s",
-        topic_title,
-        new_thread_id,
-        session.window_id,
-    )
-
-
-async def reconcile_dev_topics(bot: Bot) -> None:
-    """Startup reconciliation: create dev topics for tmux sessions without topics.
-
-    Reads session_map.json to find all active windows, checks which ones
-    are already bound, and creates dev topics for unbound ones.
-    """
-    if not config.dev_group:
-        return
-
-    session_map = session_manager.read_session_map_sync()
-    if not session_map:
-        return
-
-    # Collect all bound window IDs
-    bound_ids: set[str] = set()
-    for _, _, wid in session_manager.iter_thread_bindings():
-        bound_ids.add(wid)
-    for _, _, wid in session_manager.iter_topic_bindings():
-        bound_ids.add(wid)
-
-    created = 0
-    for map_key, info in session_map.items():
-        # map_key format: "tmux_session_name:@window_id"
-        if ":" not in map_key:
-            continue
-        tmux_session_name, window_id = map_key.rsplit(":", 1)
-        if window_id in bound_ids:
-            continue
-
-        # Use tmux session name as topic title
-        topic_title = tmux_session_name or info.get("window_name", "Session")
-
-        try:
-            forum_topic = await bot.create_forum_topic(
-                chat_id=config.dev_group, name=topic_title
-            )
-            new_thread_id = forum_topic.message_thread_id
-
-            for user_id in config.dev_users:
-                session_manager.set_group_chat_id(
-                    user_id, new_thread_id, config.dev_group
-                )
-                session_manager.bind_thread(
-                    user_id, new_thread_id, window_id,
-                    window_name=info.get("window_name", ""),
-                )
-
-            _topic_names[(config.dev_group, new_thread_id)] = topic_title
-            bound_ids.add(window_id)
-            created += 1
-            logger.info(
-                "Reconciled: created dev topic '%s' (thread=%d) for %s",
-                topic_title, new_thread_id, window_id,
-            )
-        except Exception as e:
-            logger.error("Failed to create dev topic for %s: %s", window_id, e)
-
-    if created:
-        logger.info("Reconciliation: created %d dev topics", created)
-
-
-async def handle_session_removed(window_id: str, bot: Bot) -> None:
-    """Handle a tmux session being killed — close the dev topic and send merge reminder."""
-    if not config.dev_group:
-        return
-
-    # Get the display name (worktree name) before unbinding
-    display_name = session_manager.get_display_name(window_id)
-
-    # Find thread_bindings pointing to this window in the dev group
-    for user_id, thread_id, wid in list(session_manager.iter_thread_bindings()):
-        if wid != window_id:
-            continue
-        chat_id = session_manager.resolve_chat_id(user_id, thread_id)
-        if chat_id != config.dev_group:
-            continue
-
-        # Close the topic in the dev group
-        try:
-            await bot.close_forum_topic(
-                chat_id=config.dev_group, message_thread_id=thread_id
-            )
-            logger.info(
-                "Closed dev topic (thread=%d) for removed window %s",
-                thread_id,
-                window_id,
-            )
-        except Exception as e:
-            logger.debug("Failed to close dev topic: %s", e)
-
-        session_manager.unbind_thread(user_id, thread_id)
-        await clear_topic_state(user_id, thread_id, bot)
-
-    # Send merge reminder to source conversational topic if this was a worktree session
-    source = _worktree_sources.pop(display_name, None)
-    if source:
-        source_chat_id, source_thread_id = source
-        try:
-            await safe_send(
-                bot,
-                source_chat_id,
-                f"Dev session `{display_name}` ended.\n"
-                f"Run `$merge {display_name}` to merge to main.",
-                message_thread_id=source_thread_id,
-            )
-        except Exception as e:
-            logger.debug("Failed to send merge reminder: %s", e)
-
-
 # --- App lifecycle ---
 
 
@@ -2978,21 +1104,21 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("mode", mode_command))
     application.add_handler(CommandHandler("usage", usage_command))
     application.add_handler(CallbackQueryHandler(callback_handler))
-    # Topic created event — cache topic names
+    # Topic created event -- cache topic names
     application.add_handler(
         MessageHandler(
             filters.StatusUpdate.FORUM_TOPIC_CREATED,
             topic_created_handler,
         )
     )
-    # Topic closed event — auto-kill associated window
+    # Topic closed event -- auto-kill associated window
     application.add_handler(
         MessageHandler(
             filters.StatusUpdate.FORUM_TOPIC_CLOSED,
             topic_closed_handler,
         )
     )
-    # Topic edited event — sync renamed topic to tmux window
+    # Topic edited event -- sync renamed topic to tmux window
     application.add_handler(
         MessageHandler(
             filters.StatusUpdate.FORUM_TOPIC_EDITED,

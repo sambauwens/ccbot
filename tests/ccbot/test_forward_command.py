@@ -39,9 +39,9 @@ class TestForwardCommand:
         with (
             patch("ccbot.bot.is_user_allowed", return_value=True),
             patch("ccbot.bot._get_thread_id", return_value=42),
-            patch("ccbot.bot.session_manager") as mock_sm,
-            patch("ccbot.bot.tmux_manager") as mock_tmux,
-            patch("ccbot.bot.safe_reply", new_callable=AsyncMock),
+            patch("ccbot.handlers.media.session_manager") as mock_sm,
+            patch("ccbot.handlers.media.tmux_manager") as mock_tmux,
+            patch("ccbot.handlers.media.safe_reply", new_callable=AsyncMock),
         ):
             mock_sm.resolve_window_for_thread.return_value = "@5"
             mock_sm.get_display_name.return_value = "project"
@@ -63,9 +63,9 @@ class TestForwardCommand:
         with (
             patch("ccbot.bot.is_user_allowed", return_value=True),
             patch("ccbot.bot._get_thread_id", return_value=42),
-            patch("ccbot.bot.session_manager") as mock_sm,
-            patch("ccbot.bot.tmux_manager") as mock_tmux,
-            patch("ccbot.bot.safe_reply", new_callable=AsyncMock),
+            patch("ccbot.handlers.media.session_manager") as mock_sm,
+            patch("ccbot.handlers.media.tmux_manager") as mock_tmux,
+            patch("ccbot.handlers.media.safe_reply", new_callable=AsyncMock),
         ):
             mock_sm.resolve_window_for_thread.return_value = "@5"
             mock_sm.get_display_name.return_value = "project"
@@ -87,9 +87,9 @@ class TestForwardCommand:
         with (
             patch("ccbot.bot.is_user_allowed", return_value=True),
             patch("ccbot.bot._get_thread_id", return_value=42),
-            patch("ccbot.bot.session_manager") as mock_sm,
-            patch("ccbot.bot.tmux_manager") as mock_tmux,
-            patch("ccbot.bot.safe_reply", new_callable=AsyncMock),
+            patch("ccbot.handlers.media.session_manager") as mock_sm,
+            patch("ccbot.handlers.media.tmux_manager") as mock_tmux,
+            patch("ccbot.handlers.media.safe_reply", new_callable=AsyncMock),
         ):
             mock_sm.resolve_window_for_thread.return_value = "@5"
             mock_sm.get_display_name.return_value = "project"
