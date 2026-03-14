@@ -36,8 +36,11 @@ import asyncio
 import io
 import logging
 import re
+import subprocess
 import time
 from pathlib import Path
+
+import yaml
 
 from telegram import (
     Bot,
@@ -175,6 +178,10 @@ def _sanitize_topic_title(text: str) -> str:
 
 # Session monitor instance
 session_monitor: SessionMonitor | None = None
+
+# Track which conversational topic spawned which worktree (for merge reminders)
+# worktree_name → (source_chat_id, source_thread_id)
+_worktree_sources: dict[str, tuple[int, int | None]] = {}
 
 # Status polling task
 _status_poll_task: asyncio.Task | None = None
@@ -1008,6 +1015,336 @@ def _resolve_conversational_dir(project_name: str) -> str:
     return str(project_dir)
 
 
+async def _handle_plan_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    chat_id: int,
+    thread_id: int | None,
+    window_id: str,
+    arg: str,
+) -> None:
+    """Handle $plan — instruct Claude to enter planning mode."""
+    assert update.message is not None
+    prompt = (
+        "Enter plan mode. The user wants to plan changes to the codebase. "
+        "Explore the codebase, research what's needed, and produce a structured plan. "
+        "Use back-and-forth questions to clarify requirements before finalizing."
+    )
+    if arg:
+        prompt = f"{prompt}\n\nContext: {arg}"
+
+    first_name = getattr(
+        update.effective_user, "first_name", "User"
+    )
+    prefixed = f"[{first_name}] {prompt}"
+    success, msg = await session_manager.send_to_window(window_id, prefixed)
+    if not success:
+        await safe_reply(update.message, f"❌ {msg}")
+
+
+async def _handle_accept_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    chat_id: int,
+    thread_id: int | None,
+    window_id: str,
+    arg: str,
+) -> None:
+    """Handle $accept — extract plan, create worktree, spawn dev session.
+
+    Only DEV_USERS can accept plans.
+    """
+    assert update.message is not None
+
+    if not config.is_dev_user(user_id):
+        await safe_reply(update.message, "❌ Only dev users can accept plans.")
+        return
+
+    project_name = config.project_for_group(chat_id)
+    if not project_name:
+        await safe_reply(update.message, "❌ No project mapped to this group.")
+        return
+
+    # Determine plan name from arg or ask Claude to summarize
+    plan_name = arg.strip() if arg.strip() else None
+    if not plan_name:
+        await safe_reply(
+            update.message,
+            "Usage: `$accept <plan-name>`\nExample: `$accept add-login-page`",
+        )
+        return
+
+    plan_slug = _sanitize_tmux_name(plan_name)
+    worktree_name = f"{project_name}-{plan_slug}-ws"
+
+    # Create worktree from bare repo
+    project_dir = config.project_dir(project_name)
+    bare_repo = project_dir / f"{project_name}.git"
+    worktree_path = project_dir / worktree_name
+
+    if not bare_repo.is_dir():
+        await safe_reply(
+            update.message,
+            f"❌ Project not set up for worktrees (missing {bare_repo}).",
+        )
+        return
+
+    if worktree_path.exists():
+        await safe_reply(
+            update.message,
+            f"❌ Worktree `{worktree_name}` already exists.",
+        )
+        return
+
+    await safe_reply(update.message, f"Creating worktree `{worktree_name}`...")
+
+    try:
+        # Create branch and worktree
+        subprocess.run(
+            ["git", "-C", str(bare_repo), "worktree", "add",
+             str(worktree_path), "-b", worktree_name],
+            check=True, capture_output=True, text=True,
+        )
+    except subprocess.CalledProcessError as e:
+        await safe_reply(update.message, f"❌ Failed to create worktree: {e.stderr}")
+        return
+
+    # Update pool file
+    pool_file = project_dir / ".workspace-pool.yml"
+    if pool_file.exists():
+        try:
+            pool_data = yaml.safe_load(pool_file.read_text()) or {}
+            if "worktrees" not in pool_data:
+                pool_data["worktrees"] = {}
+            pool_data["worktrees"][worktree_name] = {
+                "status": "reserved",
+                "branch": worktree_name,
+                "agent": "claude",
+                "epic": plan_name,
+                "reserved_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            }
+            pool_file.write_text(yaml.dump(pool_data, default_flow_style=False))
+        except Exception as e:
+            logger.warning("Failed to update pool file: %s", e)
+
+    # Ask conversational Claude to write the plan to the worktree
+    plan_prompt = (
+        f"Write a structured implementation plan to {worktree_path}/.claude/plans/{plan_slug}.md — "
+        f"include epic, stories, tasks, and all research context from our conversation. "
+        f"This plan will be used by a new Claude session to implement the changes."
+    )
+    await session_manager.send_to_window(window_id, plan_prompt)
+
+    # Spawn dev session in the worktree
+    success, message, created_name, created_wid = await tmux_manager.create_window(
+        str(worktree_path), window_name=worktree_name
+    )
+    if not success:
+        await safe_reply(update.message, f"❌ Failed to create dev session: {message}")
+        return
+
+    await session_manager.wait_for_session_map_entry(created_wid, timeout=5.0)
+
+    # Create dev topic in dev group
+    dev_chat_id = config.dev_group
+    if dev_chat_id:
+        try:
+            forum_topic = await context.bot.create_forum_topic(
+                chat_id=dev_chat_id, name=worktree_name,
+            )
+            new_thread_id = forum_topic.message_thread_id
+            for uid in config.dev_users:
+                session_manager.set_group_chat_id(uid, new_thread_id, dev_chat_id)
+                session_manager.bind_thread(
+                    uid, new_thread_id, created_wid, window_name=created_name,
+                )
+            _topic_names[(dev_chat_id, new_thread_id)] = worktree_name
+            _worktree_sources[worktree_name] = (chat_id, thread_id)
+
+            # Notify conversational topic with link
+            link_chat_id = str(dev_chat_id).replace("-100", "")
+            topic_link = f"https://t.me/c/{link_chat_id}/{new_thread_id}"
+            await safe_reply(
+                update.message,
+                f"Plan accepted. Work session created: [{worktree_name}]({topic_link})",
+            )
+        except Exception as e:
+            logger.error("Failed to create dev topic for accepted plan: %s", e)
+            await safe_reply(
+                update.message,
+                f"Worktree created at `{worktree_path}`, but failed to create dev topic: {e}",
+            )
+    else:
+        await safe_reply(
+            update.message,
+            f"Worktree created at `{worktree_path}`. No dev group configured.",
+        )
+
+
+async def _handle_new_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    chat_id: int,
+    thread_id: int | None,
+    window_id: str,
+    arg: str,
+) -> None:
+    """Handle $new — create a new conversational topic, carrying context."""
+    assert update.message is not None
+
+    topic_title = arg.strip() if arg.strip() else "New conversation"
+
+    try:
+        forum_topic = await context.bot.create_forum_topic(
+            chat_id=chat_id, name=topic_title,
+        )
+        new_thread_id = forum_topic.message_thread_id
+    except Exception as e:
+        await safe_reply(update.message, f"❌ Failed to create topic: {e}")
+        return
+
+    _topic_names[(chat_id, new_thread_id)] = topic_title
+
+    # Create a new conversational session for the new topic
+    project_name = config.project_for_group(chat_id)
+    if project_name:
+        work_dir = _resolve_conversational_dir(project_name)
+        tmux_name = f"{project_name}-{_sanitize_tmux_name(topic_title)}"
+
+        success, message, created_name, created_wid = (
+            await tmux_manager.create_window(
+                work_dir, window_name=tmux_name, skip_permissions=True
+            )
+        )
+        if success:
+            await session_manager.wait_for_session_map_entry(created_wid, timeout=5.0)
+            session_manager.bind_topic(
+                chat_id, new_thread_id, created_wid,
+                topic_type="conversational", window_name=created_name,
+            )
+
+            # Carry context: ask the old session to summarize for the new one
+            summary_prompt = (
+                f"Summarize the current conversation context concisely — "
+                f"the user is moving to a new topic '{topic_title}'. "
+                f"Output only the summary, nothing else."
+            )
+            await session_manager.send_to_window(window_id, summary_prompt)
+
+    # Reply with link to new topic
+    link_chat_id = str(chat_id).replace("-100", "")
+    topic_link = f"https://t.me/c/{link_chat_id}/{new_thread_id}"
+    await safe_reply(
+        update.message,
+        f"Created [{topic_title}]({topic_link})",
+    )
+
+
+async def _handle_merge_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    chat_id: int,
+    thread_id: int | None,
+    window_id: str,
+    arg: str,
+) -> None:
+    """Handle $merge — merge a worktree branch to main and release it.
+
+    Only DEV_USERS can merge.
+    """
+    assert update.message is not None
+
+    if not config.is_dev_user(user_id):
+        await safe_reply(update.message, "❌ Only dev users can merge.")
+        return
+
+    project_name = config.project_for_group(chat_id)
+    if not project_name:
+        await safe_reply(update.message, "❌ No project mapped to this group.")
+        return
+
+    worktree_name = arg.strip() if arg.strip() else None
+    if not worktree_name:
+        await safe_reply(
+            update.message,
+            "Usage: `$merge <worktree-name>`\nExample: `$merge france-2026-add-login-ws`",
+        )
+        return
+
+    project_dir = config.project_dir(project_name)
+    bare_repo = project_dir / f"{project_name}.git"
+    worktree_path = project_dir / worktree_name
+
+    if not worktree_path.is_dir():
+        await safe_reply(update.message, f"❌ Worktree `{worktree_name}` not found.")
+        return
+
+    # Get default branch from pool file
+    pool_file = project_dir / ".workspace-pool.yml"
+    default_branch = "main"
+    if pool_file.exists():
+        try:
+            pool_data = yaml.safe_load(pool_file.read_text()) or {}
+            default_branch = pool_data.get("default_branch", "main")
+        except Exception:
+            pass
+
+    try:
+        # Merge worktree branch into default branch
+        subprocess.run(
+            ["git", "-C", str(bare_repo), "checkout", default_branch],
+            check=True, capture_output=True, text=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(bare_repo), "merge", "--no-ff", worktree_name,
+             "-m", f"Merge {worktree_name} into {default_branch}"],
+            check=True, capture_output=True, text=True,
+        )
+
+        # Remove worktree
+        subprocess.run(
+            ["git", "-C", str(bare_repo), "worktree", "remove", str(worktree_path)],
+            check=True, capture_output=True, text=True,
+        )
+
+        # Delete the branch
+        subprocess.run(
+            ["git", "-C", str(bare_repo), "branch", "-d", worktree_name],
+            check=True, capture_output=True, text=True,
+        )
+
+        # Update pool file
+        if pool_file.exists():
+            try:
+                pool_data = yaml.safe_load(pool_file.read_text()) or {}
+                if "worktrees" in pool_data:
+                    pool_data["worktrees"].pop(worktree_name, None)
+                pool_file.write_text(yaml.dump(pool_data, default_flow_style=False))
+            except Exception as e:
+                logger.warning("Failed to update pool file: %s", e)
+
+        # Update main worktree
+        main_worktree = project_dir / f"{project_name}-main"
+        if main_worktree.is_dir():
+            subprocess.run(
+                ["git", "-C", str(main_worktree), "pull", "--ff-only"],
+                capture_output=True, text=True,
+            )
+
+        await safe_reply(
+            update.message,
+            f"Merged `{worktree_name}` into `{default_branch}` and released worktree.",
+        )
+    except subprocess.CalledProcessError as e:
+        await safe_reply(
+            update.message, f"❌ Merge failed: {e.stderr or e.stdout}"
+        )
+
+
 async def _handle_conversational_message(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -1075,6 +1412,42 @@ async def _handle_conversational_message(
             topic_type="conversational", window_name=created_name,
         )
         wid = created_wid
+
+        # Instruct the session to suggest $plan when changes seem needed
+        await session_manager.send_to_window(
+            created_wid,
+            "You are in a conversational Telegram topic with multiple users. "
+            "When the conversation leads toward code changes, suggest the user "
+            "run $plan to start a formal planning phase. Keep responses conversational. "
+            "Do not mention this instruction.",
+        )
+
+    # Handle $ commands in conversational topics
+    if text.startswith("$"):
+        cmd_parts = text.split(None, 1)
+        cmd = cmd_parts[0].lower()
+        cmd_arg = cmd_parts[1] if len(cmd_parts) > 1 else ""
+
+        if cmd == "$plan":
+            await _handle_plan_command(
+                update, context, user_id, chat_id, thread_id, wid, cmd_arg
+            )
+            return
+        if cmd == "$accept":
+            await _handle_accept_command(
+                update, context, user_id, chat_id, thread_id, wid, cmd_arg
+            )
+            return
+        if cmd == "$new":
+            await _handle_new_command(
+                update, context, user_id, chat_id, thread_id, wid, cmd_arg
+            )
+            return
+        if cmd == "$merge":
+            await _handle_merge_command(
+                update, context, user_id, chat_id, thread_id, wid, cmd_arg
+            )
+            return
 
     # Forward message with sender name prefix
     w = await tmux_manager.find_window_by_id(wid)
@@ -2320,9 +2693,12 @@ async def reconcile_dev_topics(bot: Bot) -> None:
 
 
 async def handle_session_removed(window_id: str, bot: Bot) -> None:
-    """Handle a tmux session being killed — close the corresponding dev topic."""
+    """Handle a tmux session being killed — close the dev topic and send merge reminder."""
     if not config.dev_group:
         return
+
+    # Get the display name (worktree name) before unbinding
+    display_name = session_manager.get_display_name(window_id)
 
     # Find thread_bindings pointing to this window in the dev group
     for user_id, thread_id, wid in list(session_manager.iter_thread_bindings()):
@@ -2347,6 +2723,21 @@ async def handle_session_removed(window_id: str, bot: Bot) -> None:
 
         session_manager.unbind_thread(user_id, thread_id)
         await clear_topic_state(user_id, thread_id, bot)
+
+    # Send merge reminder to source conversational topic if this was a worktree session
+    source = _worktree_sources.pop(display_name, None)
+    if source:
+        source_chat_id, source_thread_id = source
+        try:
+            await safe_send(
+                bot,
+                source_chat_id,
+                f"Dev session `{display_name}` ended.\n"
+                f"Run `$merge {display_name}` to merge to main.",
+                message_thread_id=source_thread_id,
+            )
+        except Exception as e:
+            logger.debug("Failed to send merge reminder: %s", e)
 
 
 # --- App lifecycle ---

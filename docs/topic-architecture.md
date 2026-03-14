@@ -94,6 +94,24 @@ User sends "hello" in dev topic (thread_id=5)
 
 **Topic lifecycle**: Closing a topic kills the associated tmux window. Stale bindings cleaned up by status polling.
 
+## $ Commands (conversational topics)
+
+| Command | Who | Description |
+|---|---|---|
+| `$plan [context]` | Any user | Instructs Claude to enter planning mode |
+| `$accept <name>` | DEV_USERS | Creates worktree, writes plan, spawns dev session |
+| `$merge <worktree>` | DEV_USERS | Merges worktree branch to main, releases worktree |
+| `$new [title]` | Any user | Creates a new conversational topic, carries context |
+
+### Planning flow:
+```
+$plan → Claude explores + writes plan → back-and-forth Q&A
+  → $accept add-login → creates france-2026-add-login-ws worktree
+  → spawns dev session in dev group → link posted in conversational topic
+  → dev work happens in the worktree
+  → $merge france-2026-add-login-ws → merges to main, releases worktree
+```
+
 ## Session Lifecycle
 
 **Startup cleanup**: On bot startup, all tracked sessions not present in session_map are cleaned up, preventing monitoring of closed sessions.

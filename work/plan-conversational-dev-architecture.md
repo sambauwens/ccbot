@@ -257,14 +257,14 @@ topic_types: dict[str, str]     # "chat_id:thread_id" → "conversational" | "de
 - [x] Startup reconciliation (create missing topics, clean stale ones)
 - [x] Remove `--dangerously-skip-permissions` default for dev sessions
 
-### Phase 4: Planning Flow
-- [ ] `$plan` command (instructs Claude to enter planning mode)
-- [ ] `$accept` command (Sam only): extract plan → create worktree → write plan files → spawn dev session
-- [ ] Worktree creation (integrate with workspaces skill: pool file, naming, setup)
-- [ ] Dev session spawned in dev group with plan context
-- [ ] On completion: merge worktree branch to main, release worktree
-- [ ] Claude instruction to suggest `$plan` when changes seem needed
-- [ ] `$new` command (create topic, carry context)
+### Phase 4: Planning Flow ✅
+- [x] `$plan` command (instructs Claude to enter planning mode)
+- [x] `$accept` command (Sam only): extract plan → create worktree → write plan files → spawn dev session
+- [x] Worktree creation (integrate with workspaces skill: pool file, naming, setup)
+- [x] Dev session spawned in dev group with plan context
+- [x] On completion: `$merge` command — merge worktree branch to main, release worktree
+- [x] Claude instruction to suggest `$plan` when changes seem needed
+- [x] `$new` command (create topic, carry context)
 
 ### Phase 5: Polish
 - [ ] Subject change detection (AI-based, suggests $new with title)

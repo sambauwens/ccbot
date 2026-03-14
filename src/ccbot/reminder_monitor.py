@@ -255,6 +255,89 @@ async def _send_reminders_for_project(
             logger.error("Failed to send reminder: %s", e)
 
 
+# Stale worktree threshold: remind after 2 days of being reserved
+STALE_WORKTREE_DAYS = 2
+
+
+async def _check_stale_worktrees(
+    bot: object,
+    project: str,
+    group_chat_id: int,
+    state: ReminderState,
+) -> None:
+    """Check for worktrees that have been reserved for too long and send reminders."""
+    from telegram import Bot
+
+    assert isinstance(bot, Bot)
+
+    pool_file = config.project_dir(project) / ".workspace-pool.yml"
+    if not pool_file.exists():
+        return
+
+    try:
+        import yaml
+
+        pool_data = yaml.safe_load(pool_file.read_text()) or {}
+    except Exception:
+        return
+
+    worktrees = pool_data.get("worktrees", {})
+    if not worktrees:
+        return
+
+    today = date.today()
+
+    for wt_name, wt_info in worktrees.items():
+        if wt_info.get("status") != "reserved":
+            continue
+
+        # Check latest commit date in the worktree for staleness
+        wt_path = config.project_dir(project) / wt_name
+        if not wt_path.is_dir():
+            continue
+
+        try:
+            import subprocess
+
+            result = subprocess.run(
+                ["git", "-C", str(wt_path), "log", "-1", "--format=%ci"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode != 0 or not result.stdout.strip():
+                continue
+            last_commit_date = date.fromisoformat(result.stdout.strip()[:10])
+        except Exception:
+            continue
+
+        days_idle = (today - last_commit_date).days
+        if days_idle < STALE_WORKTREE_DAYS:
+            continue
+
+        # Check if we already reminded today
+        reminder_key = f"{project}:worktree:{wt_name}"
+        if state._sent.get(reminder_key) == today.isoformat():
+            continue
+
+        epic = wt_info.get("epic", wt_name)
+        try:
+            await bot.send_message(
+                chat_id=group_chat_id,
+                text=(
+                    f"Worktree `{wt_name}` has been idle for {days_idle} days "
+                    f"(last commit: {last_commit_date.isoformat()}, epic: {epic}).\n"
+                    f"Run `$merge {wt_name}` to merge to main, or continue working on it."
+                ),
+            )
+            state._sent[reminder_key] = today.isoformat()
+            state._save()
+            logger.info(
+                "Sent stale worktree reminder for %s in %s (%d days idle)",
+                wt_name, project, days_idle,
+            )
+        except Exception as e:
+            logger.error("Failed to send worktree reminder: %s", e)
+
+
 async def _reminder_loop(bot: object) -> None:
     """Background loop that checks waiting-for.md files periodically."""
     state = ReminderState()
@@ -276,6 +359,11 @@ async def _reminder_loop(bot: object) -> None:
                 )
             except Exception as e:
                 logger.error("Reminder check failed for %s: %s", project, e)
+
+            try:
+                await _check_stale_worktrees(bot, project, group_chat_id, state)
+            except Exception as e:
+                logger.error("Worktree check failed for %s: %s", project, e)
 
 
 def start_reminder_loop(bot: object) -> asyncio.Task[None]:
