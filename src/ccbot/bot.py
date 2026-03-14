@@ -132,7 +132,7 @@ from .handlers.response_builder import build_response_parts
 from .handlers.status_polling import status_poll_loop
 from .screenshot import text_to_image
 from .session import session_manager
-from .session_monitor import NewMessage, SessionMonitor
+from .session_monitor import NewMessage, NewSession, SessionMonitor
 from .terminal_parser import extract_bash_output, is_interactive_ui
 from .tmux_manager import tmux_manager
 from .reminder_monitor import handle_reminder_callback, start_reminder_loop
@@ -149,6 +149,28 @@ _WINDOW_ID_RE = re.compile(r"^@\d+$")
 def _is_valid_window_id(window_id: str) -> bool:
     """Check that a window ID has the expected @<digits> format."""
     return bool(_WINDOW_ID_RE.match(window_id))
+
+
+# Topic name cache: (chat_id, thread_id) → topic name
+# Populated by FORUM_TOPIC_CREATED status messages.
+_topic_names: dict[tuple[int, int], str] = {}
+
+
+def _sanitize_tmux_name(title: str) -> str:
+    """Make a user title tmux-friendly: lowercase, dashes, no special chars."""
+    name = title.lower()
+    name = re.sub(r"[^a-z0-9-]", "-", name)
+    name = re.sub(r"-{2,}", "-", name)
+    name = name.strip("-")
+    return name[:60] or "session"
+
+
+def _sanitize_topic_title(text: str) -> str:
+    """Extract a topic title from user text: first line, max 128 chars."""
+    first_line = text.split("\n", 1)[0].strip()
+    if not first_line:
+        return "New session"
+    return first_line[:128]
 
 
 # Session monitor instance
@@ -456,6 +478,25 @@ async def topic_closed_handler(
         )
 
 
+async def topic_created_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Cache topic names from FORUM_TOPIC_CREATED service messages."""
+    msg = update.message
+    if not msg or not msg.forum_topic_created:
+        return
+    chat = update.effective_chat
+    thread_id = getattr(msg, "message_thread_id", None)
+    if chat and thread_id:
+        _topic_names[(chat.id, thread_id)] = msg.forum_topic_created.name
+        logger.debug(
+            "Cached topic name: chat=%d thread=%d name='%s'",
+            chat.id,
+            thread_id,
+            msg.forum_topic_created.name,
+        )
+
+
 async def topic_edited_handler(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -477,6 +518,11 @@ async def topic_edited_handler(
     if thread_id is None:
         return
 
+    # Update topic name cache
+    chat = update.effective_chat
+    if chat and thread_id:
+        _topic_names[(chat.id, thread_id)] = new_name
+
     wid = session_manager.get_window_for_thread(user.id, thread_id)
     if not wid:
         logger.debug(
@@ -484,13 +530,20 @@ async def topic_edited_handler(
         )
         return
 
+    # For project groups, prefix the project name to tmux session name
+    tmux_name = new_name
+    project_name = _resolve_project_for_chat(chat)
+    if project_name:
+        tmux_name = f"{project_name}-{_sanitize_tmux_name(new_name)}"
+
     old_name = session_manager.get_display_name(wid)
-    await tmux_manager.rename_window(wid, new_name)
-    session_manager.update_display_name(wid, new_name)
+    await tmux_manager.rename_window(wid, tmux_name)
+    session_manager.update_display_name(wid, tmux_name)
     logger.info(
-        "Topic renamed: '%s' -> '%s' (window=%s, user=%d, thread=%d)",
+        "Topic renamed: '%s' -> '%s' (tmux='%s', window=%s, user=%d, thread=%d)",
         old_name,
         new_name,
+        tmux_name,
         wid,
         user.id,
         thread_id,
@@ -1013,8 +1066,79 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         context.user_data.pop("_pending_thread_text", None)
         context.user_data.pop("_selected_path", None)
 
-    # Must be in a named topic
+    # General topic (thread_id is None)
     if thread_id is None:
+        project_name = _resolve_project_for_chat(chat)
+        if project_name:
+            assert chat is not None
+            # Project group: auto-create a topic + session
+            topic_title = _sanitize_topic_title(text)
+            tmux_name = f"{project_name}-{_sanitize_tmux_name(topic_title)}"
+            project_dir = str(config.project_dir(project_name))
+
+            try:
+                forum_topic = await context.bot.create_forum_topic(
+                    chat_id=chat.id,
+                    name=topic_title,
+                )
+                new_thread_id = forum_topic.message_thread_id
+            except Exception as e:
+                logger.error("Failed to create forum topic: %s", e)
+                await safe_reply(update.message, f"❌ Failed to create topic: {e}")
+                return
+
+            # Cache the topic name
+            _topic_names[(chat.id, new_thread_id)] = topic_title
+
+            # Store group chat_id for the new thread
+            session_manager.set_group_chat_id(user.id, new_thread_id, chat.id)
+
+            logger.info(
+                "General message: creating topic '%s' + session '%s' at %s "
+                "(user=%d, thread=%d)",
+                topic_title,
+                tmux_name,
+                project_dir,
+                user.id,
+                new_thread_id,
+            )
+
+            (
+                success,
+                message,
+                created_name,
+                created_wid,
+            ) = await tmux_manager.create_window(project_dir, window_name=tmux_name)
+            if success:
+                await session_manager.wait_for_session_map_entry(
+                    created_wid, timeout=5.0
+                )
+                session_manager.bind_thread(
+                    user.id, new_thread_id, created_wid, window_name=created_name
+                )
+                # Forward the original message
+                send_ok, send_msg = await session_manager.send_to_window(
+                    created_wid, text
+                )
+                if not send_ok:
+                    await safe_send(
+                        context.bot,
+                        chat.id,
+                        f"❌ {send_msg}",
+                        message_thread_id=new_thread_id,
+                    )
+                # Reply in General with a link to the new topic
+                link_chat_id = str(chat.id).replace("-100", "")
+                topic_link = f"https://t.me/c/{link_chat_id}/{new_thread_id}"
+                await safe_reply(
+                    update.message,
+                    f"Created [{topic_title}]({topic_link})",
+                )
+            else:
+                await safe_reply(update.message, f"❌ {message}")
+            return
+
+        # Not a project group — reject
         await safe_reply(
             update.message,
             "❌ Please use a named topic. Create a new topic to start a session.",
@@ -1027,11 +1151,20 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         project_name = _resolve_project_for_chat(chat)
         if project_name:
             # Project group: auto-create session in the project directory
+            # Use cached topic name for tmux session naming
+            topic_name = _topic_names.get(
+                (chat.id, thread_id)  # type: ignore[arg-type]
+            )
+            if topic_name:
+                tmux_name = f"{project_name}-{_sanitize_tmux_name(topic_name)}"
+            else:
+                tmux_name = project_name
             project_dir = str(config.project_dir(project_name))
             logger.info(
-                "Unbound topic in project group '%s': creating session at %s "
+                "Unbound topic in project group '%s': creating session '%s' at %s "
                 "(user=%d, thread=%d)",
                 project_name,
+                tmux_name,
                 project_dir,
                 user.id,
                 thread_id,
@@ -1050,7 +1183,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 message,
                 created_name,
                 created_wid,
-            ) = await tmux_manager.create_window(project_dir, window_name=project_name)
+            ) = await tmux_manager.create_window(project_dir, window_name=tmux_name)
             if success:
                 # Wait for hook registration
                 await session_manager.wait_for_session_map_entry(
@@ -1059,16 +1192,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 session_manager.bind_thread(
                     user.id, thread_id, created_wid, window_name=created_name
                 )
-                # Rename the topic
-                resolved_chat = session_manager.resolve_chat_id(user.id, thread_id)
-                try:
-                    await context.bot.edit_forum_topic(
-                        chat_id=resolved_chat,
-                        message_thread_id=thread_id,
-                        name=created_name,
-                    )
-                except Exception as e:
-                    logger.debug("Failed to rename topic: %s", e)
+                # Do NOT rename the Telegram topic — preserve user's chosen name
                 # Forward the pending text
                 send_ok, send_msg = await session_manager.send_to_window(
                     created_wid, text
@@ -1266,16 +1390,8 @@ async def _create_and_bind_window(
                 user.id, pending_thread_id, created_wid, window_name=created_wname
             )
 
-            # Rename the topic to match the window name
+            # Do NOT rename the Telegram topic — preserve user's chosen name
             resolved_chat = session_manager.resolve_chat_id(user.id, pending_thread_id)
-            try:
-                await context.bot.edit_forum_topic(
-                    chat_id=resolved_chat,
-                    message_thread_id=pending_thread_id,
-                    name=created_wname,
-                )
-            except Exception as e:
-                logger.debug(f"Failed to rename topic: {e}")
 
             status = "Resumed" if resume_session_id else "Created"
             await safe_edit(
@@ -2063,6 +2179,75 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
                     pass
 
 
+async def handle_new_session(session: NewSession, bot: Bot) -> None:
+    """Auto-create a Telegram topic for a new unbound session in a project group."""
+    # Check if this window is already bound to a topic
+    for _, _, bound_wid in session_manager.iter_thread_bindings():
+        if bound_wid == session.window_id:
+            logger.debug(
+                "New session %s already bound, skipping topic creation",
+                session.window_id,
+            )
+            return
+
+    # Check if cwd maps to a project group
+    project_name = config.project_for_cwd(session.cwd)
+    if not project_name:
+        logger.debug(
+            "New session %s cwd=%s not in any project group",
+            session.window_id,
+            session.cwd,
+        )
+        return
+
+    chat_id = config.project_groups.get(project_name)
+    if not chat_id:
+        return
+
+    # Derive topic name from tmux window name (strip project prefix if present)
+    topic_title = session.window_name
+    prefix = f"{project_name}-"
+    if topic_title.lower().startswith(prefix):
+        topic_title = topic_title[len(prefix) :]
+    if not topic_title:
+        topic_title = session.window_name or "New session"
+
+    logger.info(
+        "Auto-creating topic '%s' for new session %s (project=%s, chat=%d)",
+        topic_title,
+        session.window_id,
+        project_name,
+        chat_id,
+    )
+
+    try:
+        forum_topic = await bot.create_forum_topic(chat_id=chat_id, name=topic_title)
+        new_thread_id = forum_topic.message_thread_id
+    except Exception as e:
+        logger.error(
+            "Failed to auto-create topic for session %s: %s", session.window_id, e
+        )
+        return
+
+    # Bind for all allowed users
+    for user_id in config.allowed_users:
+        session_manager.set_group_chat_id(user_id, new_thread_id, chat_id)
+        session_manager.bind_thread(
+            user_id,
+            new_thread_id,
+            session.window_id,
+            window_name=session.window_name,
+        )
+
+    _topic_names[(chat_id, new_thread_id)] = topic_title
+    logger.info(
+        "Auto-created topic '%s' (thread=%d) for session %s",
+        topic_title,
+        new_thread_id,
+        session.window_id,
+    )
+
+
 # --- App lifecycle ---
 
 
@@ -2107,7 +2292,11 @@ async def post_init(application: Application) -> None:
     async def message_callback(msg: NewMessage) -> None:
         await handle_new_message(msg, application.bot)
 
+    async def new_session_callback(session: NewSession) -> None:
+        await handle_new_session(session, application.bot)
+
     monitor.set_message_callback(message_callback)
+    monitor.set_new_session_callback(new_session_callback)
     monitor.start()
     session_monitor = monitor
     logger.info("Session monitor started")
@@ -2176,6 +2365,13 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("mode", mode_command))
     application.add_handler(CommandHandler("usage", usage_command))
     application.add_handler(CallbackQueryHandler(callback_handler))
+    # Topic created event — cache topic names
+    application.add_handler(
+        MessageHandler(
+            filters.StatusUpdate.FORUM_TOPIC_CREATED,
+            topic_created_handler,
+        )
+    )
     # Topic closed event — auto-kill associated window
     application.add_handler(
         MessageHandler(

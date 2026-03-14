@@ -154,5 +154,20 @@ class Config:
         """Look up the project name for a Telegram group chat_id."""
         return self.group_to_project.get(chat_id)
 
+    def project_for_cwd(self, cwd: str) -> str | None:
+        """Look up the project name for a cwd path.
+
+        Matches if cwd is at or under projects_dir/<project_name>.
+        """
+        try:
+            cwd_path = Path(cwd).resolve()
+        except (OSError, ValueError):
+            return None
+        for project_name in self.project_groups:
+            project_path = self.project_dir(project_name).resolve()
+            if cwd_path == project_path or project_path in cwd_path.parents:
+                return project_name
+        return None
+
 
 config = Config()

@@ -38,6 +38,16 @@ class SessionInfo:
 
 
 @dataclass
+class NewSession:
+    """A new session detected in session_map (not yet bound to a topic)."""
+
+    window_id: str
+    session_id: str
+    cwd: str
+    window_name: str
+
+
+@dataclass
 class NewMessage:
     """A new message detected by the monitor."""
 
@@ -77,11 +87,14 @@ class SessionMonitor:
         self._running = False
         self._task: asyncio.Task | None = None
         self._message_callback: Callable[[NewMessage], Awaitable[None]] | None = None
+        self._new_session_callback: Callable[[NewSession], Awaitable[None]] | None = (
+            None
+        )
         # Per-session pending tool_use state carried across poll cycles
         self._pending_tools: dict[str, dict[str, Any]] = {}  # session_id -> pending
         # Track last known session_map for detecting changes
         # Keys may be window_id (@12) or window_name (old format) during transition
-        self._last_session_map: dict[str, str] = {}  # window_key -> session_id
+        self._last_session_map: dict[str, dict[str, str]] = {}  # window_key -> info
         # In-memory mtime cache for quick file change detection (not persisted)
         self._file_mtimes: dict[str, float] = {}  # session_id -> last_seen_mtime
 
@@ -89,6 +102,11 @@ class SessionMonitor:
         self, callback: Callable[[NewMessage], Awaitable[None]]
     ) -> None:
         self._message_callback = callback
+
+    def set_new_session_callback(
+        self, callback: Callable[[NewSession], Awaitable[None]]
+    ) -> None:
+        self._new_session_callback = callback
 
     async def _get_active_cwds(self) -> set[str]:
         """Get normalized cwds of all active tmux windows."""
@@ -379,14 +397,18 @@ class SessionMonitor:
         self.state.save_if_dirty()
         return new_messages
 
-    async def _load_current_session_map(self) -> dict[str, str]:
-        """Load current session_map and return window_key -> session_id mapping.
+    async def _load_current_session_map(
+        self,
+    ) -> dict[str, dict[str, str]]:
+        """Load current session_map and return window_key -> info mapping.
 
         Keys in session_map are formatted as "tmux_session:window_id"
         (e.g. "france-2026:@12"). All entries are processed regardless of
         tmux session name (session-per-instance model).
+
+        Returns dict of window_key -> {"session_id", "cwd", "window_name"}.
         """
-        window_to_session: dict[str, str] = {}
+        window_map: dict[str, dict[str, str]] = {}
         if config.session_map_file.exists():
             try:
                 async with aiofiles.open(config.session_map_file, "r") as f:
@@ -402,15 +424,19 @@ class SessionMonitor:
                         window_key = key[idx + 1 :]
                     session_id = info.get("session_id", "")
                     if session_id:
-                        window_to_session[window_key] = session_id
+                        window_map[window_key] = {
+                            "session_id": session_id,
+                            "cwd": info.get("cwd", ""),
+                            "window_name": info.get("window_name", ""),
+                        }
             except (json.JSONDecodeError, OSError):
                 pass
-        return window_to_session
+        return window_map
 
     async def _cleanup_all_stale_sessions(self) -> None:
         """Clean up all tracked sessions not in current session_map (used on startup)."""
         current_map = await self._load_current_session_map()
-        active_session_ids = set(current_map.values())
+        active_session_ids = {v["session_id"] for v in current_map.values()}
 
         stale_sessions = []
         for session_id in self.state.tracked_sessions.keys():
@@ -426,26 +452,27 @@ class SessionMonitor:
                 self._file_mtimes.pop(session_id, None)
             self.state.save_if_dirty()
 
-    async def _detect_and_cleanup_changes(self) -> dict[str, str]:
+    async def _detect_and_cleanup_changes(self) -> dict[str, dict[str, str]]:
         """Detect session_map changes and cleanup replaced/removed sessions.
 
-        Returns current session_map for further processing.
+        Returns current session_map (window_key -> info dict) for further processing.
+        Also invokes new_session_callback for newly appeared windows.
         """
         current_map = await self._load_current_session_map()
 
         sessions_to_remove: set[str] = set()
 
         # Check for window session changes (window exists in both, but session_id changed)
-        for window_id, old_session_id in self._last_session_map.items():
-            new_session_id = current_map.get(window_id)
-            if new_session_id and new_session_id != old_session_id:
+        for window_id, old_info in self._last_session_map.items():
+            new_info = current_map.get(window_id)
+            if new_info and new_info["session_id"] != old_info["session_id"]:
                 logger.info(
                     "Window '%s' session changed: %s -> %s",
                     window_id,
-                    old_session_id,
-                    new_session_id,
+                    old_info["session_id"],
+                    new_info["session_id"],
                 )
-                sessions_to_remove.add(old_session_id)
+                sessions_to_remove.add(old_info["session_id"])
 
         # Check for deleted windows (window in old map but not in current)
         old_windows = set(self._last_session_map.keys())
@@ -453,13 +480,13 @@ class SessionMonitor:
         deleted_windows = old_windows - current_windows
 
         for window_id in deleted_windows:
-            old_session_id = self._last_session_map[window_id]
+            old_info = self._last_session_map[window_id]
             logger.info(
                 "Window '%s' deleted, removing session %s",
                 window_id,
-                old_session_id,
+                old_info["session_id"],
             )
-            sessions_to_remove.add(old_session_id)
+            sessions_to_remove.add(old_info["session_id"])
 
         # Perform cleanup
         if sessions_to_remove:
@@ -467,6 +494,23 @@ class SessionMonitor:
                 self.state.remove_session(session_id)
                 self._file_mtimes.pop(session_id, None)
             self.state.save_if_dirty()
+
+        # Detect new windows and notify callback
+        new_windows = current_windows - old_windows
+        if new_windows and self._new_session_callback:
+            for window_id in new_windows:
+                info = current_map[window_id]
+                try:
+                    await self._new_session_callback(
+                        NewSession(
+                            window_id=window_id,
+                            session_id=info["session_id"],
+                            cwd=info["cwd"],
+                            window_name=info["window_name"],
+                        )
+                    )
+                except Exception as e:
+                    logger.error("New session callback error: %s", e)
 
         # Update last known map
         self._last_session_map = current_map
@@ -495,7 +539,7 @@ class SessionMonitor:
 
                 # Detect session_map changes and cleanup replaced/removed sessions
                 current_map = await self._detect_and_cleanup_changes()
-                active_session_ids = set(current_map.values())
+                active_session_ids = {v["session_id"] for v in current_map.values()}
 
                 # Check for new messages (all I/O is async)
                 new_messages = await self.check_for_updates(active_session_ids)

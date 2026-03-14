@@ -170,6 +170,23 @@ async def status_poll_loop(bot: Bot) -> None:
                     # Clean up stale bindings (window no longer exists)
                     w = await tmux_manager.find_window_by_id(wid)
                     if not w:
+                        # Auto-close topic in project groups
+                        chat_id = session_manager.resolve_chat_id(user_id, thread_id)
+                        from ..config import config
+
+                        if config.project_for_group(chat_id):
+                            try:
+                                await bot.close_forum_topic(
+                                    chat_id=chat_id,
+                                    message_thread_id=thread_id,
+                                )
+                                logger.info(
+                                    "Auto-closed topic: chat=%d thread=%d",
+                                    chat_id,
+                                    thread_id,
+                                )
+                            except Exception as e:
+                                logger.debug("Failed to close topic: %s", e)
                         session_manager.unbind_thread(user_id, thread_id)
                         await clear_topic_state(user_id, thread_id, bot)
                         logger.info(
