@@ -565,16 +565,24 @@ async def handle_conversational_message(
             thread_id,
         )
 
+        # Check for resume_session_id from auto-restart
+        resume_id = None
+        if context.user_data:
+            resume_id = context.user_data.pop("_conv_resume_session_id", None)
+
         success, message, created_name, created_wid = await tmux_manager.create_window(
             work_dir,
             window_name=tmux_name,
-            allowed_tools="Read,Glob,Grep,Agent,WebSearch,WebFetch,LSP"
+            allowed_tools="Read,Glob,Grep,Agent,WebSearch,WebFetch,LSP",
+            resume_session_id=resume_id,
         )
         if not success:
             await safe_reply(update.message, f"❌ {message}")
             return
 
-        await session_manager.wait_for_session_map_entry(created_wid, timeout=5.0)
+        # Longer timeout for --resume (slower to load)
+        timeout = 15.0 if resume_id else 5.0
+        await session_manager.wait_for_session_map_entry(created_wid, timeout=timeout)
         session_manager.bind_topic(
             chat_id,
             thread_id,
@@ -648,8 +656,13 @@ async def handle_conversational_message(
     # Forward message with sender name prefix
     w = await tmux_manager.find_window_by_id(wid)
     if not w:
-        # Session died — auto-restart by unbinding and recursing
+        # Session died — auto-restart with --resume to preserve context
+        old_session = await session_manager.resolve_session_for_window(wid)
+        resume_id = old_session.session_id if old_session else None
         session_manager.unbind_topic(chat_id, thread_id)
+        # Store resume_id for the creation path
+        if context.user_data is not None and resume_id:
+            context.user_data["_conv_resume_session_id"] = resume_id
         await handle_conversational_message(
             update, context, user, chat_id, thread_id, text
         )

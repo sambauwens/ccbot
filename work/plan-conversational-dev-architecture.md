@@ -25,7 +25,7 @@ Sam primarily uses terminal (via moshi) for dev work. Telegram dev topics comple
 
 **Conversational topic** (human-created, higher-order):
 - Created when any user creates a topic, or via `$new` from General
-- Claude Code session with `--dangerously-skip-permissions` in main branch worktree
+- Claude Code session with `--allowedTools Read,Glob,Grep,Agent,WebSearch,WebFetch,LSP` in main branch worktree
 - All users' messages go to the same session (multi-user)
 - Can be just Q&A, research, discussion — not everything leads to planning
 - Claude is instructed to suggest `$plan` when conversation leads toward code changes
@@ -104,7 +104,7 @@ topic_types: dict[str, str]     # "chat_id:thread_id" → "conversational" | "de
 1. User creates topic or sends first message in new topic
 2. Determine project from group config
 3. Find main branch worktree: `<project>/<project>-main/`
-4. Launch Claude Code: `claude --dangerously-skip-permissions` in that directory
+4. Launch Claude Code with `--allowedTools Read,Glob,Grep,Agent,WebSearch,WebFetch,LSP` (read-only + web, writes prompt for approval)
 5. Bind via `topic_bindings`
 6. Claude session instructions include: suggest `$plan` when changes seem needed
 7. Forward the user's message
