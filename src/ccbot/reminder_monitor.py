@@ -269,7 +269,7 @@ async def _reminder_loop(bot: object) -> None:
         first_run = False
 
         logger.debug("Reminder check starting")
-        for project, group_chat_id in config.project_groups.items():
+        for project, group_chat_id in config.conversational_groups.items():
             try:
                 await _send_reminders_for_project(
                     bot, project, group_chat_id, state, reminders_topics
@@ -311,7 +311,7 @@ async def handle_reminder_callback(bot: object, data: str, query: object) -> boo
         return True
 
     # Validate project is a known project (prevent path traversal)
-    if project not in config.project_groups:
+    if project not in config.conversational_groups:
         await query.answer("Unknown project")
         return True
 

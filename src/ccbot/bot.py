@@ -996,6 +996,100 @@ async def mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+def _resolve_conversational_dir(project_name: str) -> str:
+    """Find the directory for a conversational session.
+
+    Uses the main branch worktree if the project has one, otherwise the project dir.
+    """
+    project_dir = config.project_dir(project_name)
+    main_worktree = project_dir / f"{project_name}-main"
+    if main_worktree.is_dir():
+        return str(main_worktree)
+    return str(project_dir)
+
+
+async def _handle_conversational_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    user: object,
+    chat_id: int,
+    thread_id: int | None,
+    text: str,
+) -> None:
+    """Handle a message in a conversational topic (or General).
+
+    Creates a Claude Code session if the topic isn't bound yet, then forwards
+    the message with the sender's name prefix.
+    """
+    assert update.message is not None
+    user_id = getattr(user, "id", 0)
+    first_name = getattr(user, "first_name", "User")
+
+    # Access control: dev group is DEV_USERS only
+    if config.is_dev_group(chat_id) and not config.is_dev_user(user_id):
+        await safe_reply(update.message, "❌ You don't have access to the dev group.")
+        return
+
+    wid = session_manager.get_window_for_topic(chat_id, thread_id)
+
+    if not wid:
+        # Need to create a conversational session
+        project_name = config.project_for_group(chat_id)
+        if not project_name:
+            # Dev group — no project mapping, use directory browser later
+            # For now, respond that we need a project context
+            await safe_reply(
+                update.message,
+                "❌ Dev group conversational topics are not yet implemented.",
+            )
+            return
+
+        work_dir = _resolve_conversational_dir(project_name)
+        topic_name = _topic_names.get((chat_id, thread_id or 0))
+        tmux_name = f"{project_name}-chat"
+        if topic_name:
+            tmux_name = f"{project_name}-{_sanitize_tmux_name(topic_name)}"
+        elif thread_id is None:
+            tmux_name = f"{project_name}-general"
+
+        logger.info(
+            "Creating conversational session '%s' at %s (chat=%d, thread=%s)",
+            tmux_name,
+            work_dir,
+            chat_id,
+            thread_id,
+        )
+
+        success, message, created_name, created_wid = (
+            await tmux_manager.create_window(
+                work_dir, window_name=tmux_name, skip_permissions=True
+            )
+        )
+        if not success:
+            await safe_reply(update.message, f"❌ {message}")
+            return
+
+        await session_manager.wait_for_session_map_entry(created_wid, timeout=5.0)
+        session_manager.bind_topic(
+            chat_id, thread_id, created_wid,
+            topic_type="conversational", window_name=created_name,
+        )
+        wid = created_wid
+
+    # Forward message with sender name prefix
+    w = await tmux_manager.find_window_by_id(wid)
+    if not w:
+        session_manager.unbind_topic(chat_id, thread_id)
+        await safe_reply(update.message, "❌ Session closed. Send again to restart.")
+        return
+
+    prefixed_text = f"[{first_name}] {text}"
+    await update.message.chat.send_action(ChatAction.TYPING)
+    success, msg = await session_manager.send_to_window(wid, prefixed_text)
+    if not success:
+        await safe_reply(update.message, f"❌ {msg}")
+
+
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if not user or not is_user_allowed(user.id):
@@ -1066,147 +1160,51 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         context.user_data.pop("_pending_thread_text", None)
         context.user_data.pop("_selected_path", None)
 
-    # General topic (thread_id is None)
+    # General topic (thread_id is None) or any topic in a managed group
+    chat_id = chat.id if chat else None
+
     if thread_id is None:
-        project_name = _resolve_project_for_chat(chat)
-        if project_name:
-            assert chat is not None
-            # Project group: auto-create a topic + session
-            topic_title = _sanitize_topic_title(text)
-            tmux_name = f"{project_name}-{_sanitize_tmux_name(topic_title)}"
-            project_dir = str(config.project_dir(project_name))
-
-            try:
-                forum_topic = await context.bot.create_forum_topic(
-                    chat_id=chat.id,
-                    name=topic_title,
-                )
-                new_thread_id = forum_topic.message_thread_id
-            except Exception as e:
-                logger.error("Failed to create forum topic: %s", e)
-                await safe_reply(update.message, f"❌ Failed to create topic: {e}")
-                return
-
-            # Cache the topic name
-            _topic_names[(chat.id, new_thread_id)] = topic_title
-
-            # Store group chat_id for the new thread
-            session_manager.set_group_chat_id(user.id, new_thread_id, chat.id)
-
-            logger.info(
-                "General message: creating topic '%s' + session '%s' at %s "
-                "(user=%d, thread=%d)",
-                topic_title,
-                tmux_name,
-                project_dir,
-                user.id,
-                new_thread_id,
+        # General topic
+        if chat_id and (
+            config.is_conversational_group(chat_id) or config.is_dev_group(chat_id)
+        ):
+            # Conversational session in General — route through topic_bindings
+            await _handle_conversational_message(
+                update, context, user, chat_id, None, text
             )
-
-            (
-                success,
-                message,
-                created_name,
-                created_wid,
-            ) = await tmux_manager.create_window(project_dir, window_name=tmux_name)
-            if success:
-                await session_manager.wait_for_session_map_entry(
-                    created_wid, timeout=5.0
-                )
-                session_manager.bind_thread(
-                    user.id, new_thread_id, created_wid, window_name=created_name
-                )
-                # Forward the original message
-                send_ok, send_msg = await session_manager.send_to_window(
-                    created_wid, text
-                )
-                if not send_ok:
-                    await safe_send(
-                        context.bot,
-                        chat.id,
-                        f"❌ {send_msg}",
-                        message_thread_id=new_thread_id,
-                    )
-                # Reply in General with a link to the new topic
-                link_chat_id = str(chat.id).replace("-100", "")
-                topic_link = f"https://t.me/c/{link_chat_id}/{new_thread_id}"
-                await safe_reply(
-                    update.message,
-                    f"Created [{topic_title}]({topic_link})",
-                )
-            else:
-                await safe_reply(update.message, f"❌ {message}")
             return
 
-        # Not a project group — reject
+        # Not a managed group — reject
         await safe_reply(
             update.message,
             "❌ Please use a named topic. Create a new topic to start a session.",
         )
         return
 
+    # Check topic_bindings first (conversational topics)
+    wid = None
+    if chat_id:
+        wid = session_manager.get_window_for_topic(chat_id, thread_id)
+    if wid:
+        # Conversational topic — route through shared session
+        await _handle_conversational_message(
+            update, context, user, chat_id, thread_id, text  # type: ignore[arg-type]
+        )
+        return
+
     wid = session_manager.get_window_for_thread(user.id, thread_id)
     if wid is None:
-        # Unbound topic — check if this is a project group
-        project_name = _resolve_project_for_chat(chat)
-        if project_name:
-            # Project group: auto-create session in the project directory
-            # Use cached topic name for tmux session naming
-            topic_name = _topic_names.get(
-                (chat.id, thread_id)  # type: ignore[arg-type]
+        # Unbound topic — check if this is a conversational or dev group
+        if chat_id and (
+            config.is_conversational_group(chat_id) or config.is_dev_group(chat_id)
+        ):
+            # User-created topic in managed group → conversational topic
+            await _handle_conversational_message(
+                update, context, user, chat_id, thread_id, text  # type: ignore[arg-type]
             )
-            if topic_name:
-                tmux_name = f"{project_name}-{_sanitize_tmux_name(topic_name)}"
-            else:
-                tmux_name = project_name
-            project_dir = str(config.project_dir(project_name))
-            logger.info(
-                "Unbound topic in project group '%s': creating session '%s' at %s "
-                "(user=%d, thread=%d)",
-                project_name,
-                tmux_name,
-                project_dir,
-                user.id,
-                thread_id,
-            )
-            await safe_reply(
-                update.message, f"⏳ Creating session in `{project_name}`..."
-            )
-
-            # Store pending text for after creation
-            if context.user_data is not None:
-                context.user_data["_pending_thread_id"] = thread_id
-                context.user_data["_pending_thread_text"] = text
-
-            (
-                success,
-                message,
-                created_name,
-                created_wid,
-            ) = await tmux_manager.create_window(project_dir, window_name=tmux_name)
-            if success:
-                # Wait for hook registration
-                await session_manager.wait_for_session_map_entry(
-                    created_wid, timeout=5.0
-                )
-                session_manager.bind_thread(
-                    user.id, thread_id, created_wid, window_name=created_name
-                )
-                # Do NOT rename the Telegram topic — preserve user's chosen name
-                # Forward the pending text
-                send_ok, send_msg = await session_manager.send_to_window(
-                    created_wid, text
-                )
-                if not send_ok:
-                    await safe_reply(update.message, f"❌ {send_msg}")
-            else:
-                await safe_reply(update.message, f"❌ {message}")
-            if context.user_data is not None:
-                context.user_data.pop("_pending_thread_id", None)
-                context.user_data.pop("_pending_thread_text", None)
             return
 
-        # Not a project group — fall back to window picker / directory browser
+        # Not a managed group — fall back to window picker / directory browser
         all_windows = await tmux_manager.list_windows()
         bound_ids = {wid for _, _, wid in session_manager.iter_thread_bindings()}
         unbound = [
@@ -2106,10 +2104,32 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
         f"text_len={len(msg.text)}"
     )
 
-    # Find users whose thread-bound window matches this session
+    # Check topic_bindings first (conversational topics — deliver to topic, not per-user)
+    active_topics = await session_manager.find_topics_for_session(msg.session_id)
+    if active_topics and msg.is_complete:
+        parts = build_response_parts(
+            msg.text, msg.is_complete, msg.content_type, msg.role,
+        )
+        for topic_chat_id, topic_thread_id, wid in active_topics:
+            # Use a synthetic user_id for the queue (negative chat_id as key)
+            queue_user_id = topic_chat_id  # use chat_id as queue key
+            await enqueue_content_message(
+                bot=bot,
+                user_id=queue_user_id,
+                window_id=wid,
+                parts=parts,
+                tool_use_id=msg.tool_use_id,
+                content_type=msg.content_type,
+                text=msg.text,
+                thread_id=topic_thread_id,
+                image_data=msg.image_data,
+            )
+        return
+
+    # Find users whose thread-bound window matches this session (dev topics)
     active_users = await session_manager.find_users_for_session(msg.session_id)
 
-    if not active_users:
+    if not active_users and not active_topics:
         logger.info(f"No active users for session {msg.session_id}")
         return
 
@@ -2180,43 +2200,33 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
 
 
 async def handle_new_session(session: NewSession, bot: Bot) -> None:
-    """Auto-create a Telegram topic for a new unbound session in a project group."""
-    # Check if this window is already bound to a topic
+    """Auto-create a Telegram topic for a new session in the dev group.
+
+    Phase 3: bidirectional tmux ↔ dev topic sync. For now, creates dev topics
+    in the dev group for new tmux sessions. Conversational groups are skipped.
+    """
+    # Check if this window is already bound (thread_bindings or topic_bindings)
     for _, _, bound_wid in session_manager.iter_thread_bindings():
         if bound_wid == session.window_id:
-            logger.debug(
-                "New session %s already bound, skipping topic creation",
-                session.window_id,
-            )
+            return
+    for _, _, bound_wid in session_manager.iter_topic_bindings():
+        if bound_wid == session.window_id:
             return
 
-    # Check if cwd maps to a project group
-    project_name = config.project_for_cwd(session.cwd)
-    if not project_name:
-        logger.debug(
-            "New session %s cwd=%s not in any project group",
-            session.window_id,
-            session.cwd,
-        )
-        return
-
-    chat_id = config.project_groups.get(project_name)
+    # Dev group sync: create a dev topic for this tmux session
+    chat_id = config.dev_group
     if not chat_id:
         return
 
-    # Derive topic name from tmux window name (strip project prefix if present)
-    topic_title = session.window_name
-    prefix = f"{project_name}-"
-    if topic_title.lower().startswith(prefix):
-        topic_title = topic_title[len(prefix) :]
+    # Derive topic name from tmux session name
+    topic_title = session.tmux_session_name or session.window_name
     if not topic_title:
-        topic_title = session.window_name or "New session"
+        topic_title = "New session"
 
     logger.info(
-        "Auto-creating topic '%s' for new session %s (project=%s, chat=%d)",
+        "Auto-creating dev topic '%s' for session %s (chat=%d)",
         topic_title,
         session.window_id,
-        project_name,
         chat_id,
     )
 
@@ -2229,8 +2239,8 @@ async def handle_new_session(session: NewSession, bot: Bot) -> None:
         )
         return
 
-    # Bind for all allowed users
-    for user_id in config.allowed_users:
+    # Bind for DEV_USERS only (dev group is Sam-only)
+    for user_id in config.dev_users:
         session_manager.set_group_chat_id(user_id, new_thread_id, chat_id)
         session_manager.bind_thread(
             user_id,
@@ -2241,7 +2251,7 @@ async def handle_new_session(session: NewSession, bot: Bot) -> None:
 
     _topic_names[(chat_id, new_thread_id)] = topic_title
     logger.info(
-        "Auto-created topic '%s' (thread=%d) for session %s",
+        "Auto-created dev topic '%s' (thread=%d) for session %s",
         topic_title,
         new_thread_id,
         session.window_id,
@@ -2305,8 +2315,8 @@ async def post_init(application: Application) -> None:
     _status_poll_task = asyncio.create_task(status_poll_loop(application.bot))
     logger.info("Status polling task started")
 
-    # Start reminder monitor if project groups are configured
-    if config.project_groups:
+    # Start reminder monitor if conversational groups are configured
+    if config.conversational_groups:
         _reminder_task = start_reminder_loop(application.bot)
         logger.info(
             "Reminder monitor started (interval: %ds)", config.reminder_interval

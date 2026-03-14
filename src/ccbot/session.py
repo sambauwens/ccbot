@@ -110,6 +110,12 @@ class SessionManager:
     # History: originally added in 5afc111, erroneously removed in 26cb81f,
     # restored in PR #23.
     group_chat_ids: dict[str, int] = field(default_factory=dict)
+    # Conversational topic bindings: "chat_id:thread_id" -> window_id
+    # Unlike thread_bindings (per-user), these are per-topic: any user can route through them.
+    # thread_id=0 represents the General topic (thread_id is None in Telegram).
+    topic_bindings: dict[str, str] = field(default_factory=dict)
+    # Topic type tracking: "chat_id:thread_id" -> "conversational" | "dev"
+    topic_types: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self._load_state()
@@ -126,6 +132,8 @@ class SessionManager:
             },
             "window_display_names": self.window_display_names,
             "group_chat_ids": self.group_chat_ids,
+            "topic_bindings": self.topic_bindings,
+            "topic_types": self.topic_types,
         }
         atomic_write_json(config.state_file, state)
         logger.debug("State saved to %s", config.state_file)
@@ -159,6 +167,8 @@ class SessionManager:
                 self.group_chat_ids = {
                     k: int(v) for k, v in state.get("group_chat_ids", {}).items()
                 }
+                self.topic_bindings = state.get("topic_bindings", {})
+                self.topic_types = state.get("topic_types", {})
 
                 # Detect old format: keys that don't look like window IDs
                 needs_migration = False
@@ -442,12 +452,16 @@ class SessionManager:
 
         Returns the stored group chat_id when a thread_id is present and a
         mapping exists, otherwise falls back to user_id (for private chats).
+        Negative user_ids are already group chat_ids (from topic_bindings).
 
         Every outbound Telegram API call (send_message, edit_message_text,
         delete_message, send_chat_action, edit_forum_topic, etc.) MUST use
         this method instead of raw user_id. Using user_id directly breaks
         supergroup forum topic routing.
         """
+        # Negative IDs are group chat_ids (used by topic_bindings delivery)
+        if user_id < 0:
+            return user_id
         if thread_id is not None:
             key = f"{user_id}:{thread_id}"
             group_id = self.group_chat_ids.get(key)
@@ -797,6 +811,79 @@ class SessionManager:
         for user_id, bindings in self.thread_bindings.items():
             for thread_id, window_id in bindings.items():
                 yield user_id, thread_id, window_id
+
+    # --- Topic-level bindings (conversational topics) ---
+
+    @staticmethod
+    def _topic_key(chat_id: int, thread_id: int | None) -> str:
+        """Build topic binding key. thread_id=None (General) maps to 0."""
+        return f"{chat_id}:{thread_id or 0}"
+
+    def bind_topic(
+        self,
+        chat_id: int,
+        thread_id: int | None,
+        window_id: str,
+        topic_type: str = "conversational",
+        window_name: str = "",
+    ) -> None:
+        """Bind a topic (chat_id + thread_id) to a window. Any user can route through it."""
+        key = self._topic_key(chat_id, thread_id)
+        self.topic_bindings[key] = window_id
+        self.topic_types[key] = topic_type
+        if window_name:
+            self.window_display_names[window_id] = window_name
+        self._save_state()
+        logger.info(
+            "Bound topic %s -> window_id %s (type=%s)", key, window_id, topic_type
+        )
+
+    def unbind_topic(self, chat_id: int, thread_id: int | None) -> str | None:
+        """Remove a topic binding. Returns the previously bound window_id, or None."""
+        key = self._topic_key(chat_id, thread_id)
+        window_id = self.topic_bindings.pop(key, None)
+        self.topic_types.pop(key, None)
+        if window_id:
+            self._save_state()
+            logger.info("Unbound topic %s (was %s)", key, window_id)
+        return window_id
+
+    def get_window_for_topic(
+        self, chat_id: int, thread_id: int | None
+    ) -> str | None:
+        """Look up the window_id bound to a topic."""
+        return self.topic_bindings.get(self._topic_key(chat_id, thread_id))
+
+    def get_topic_type(
+        self, chat_id: int, thread_id: int | None
+    ) -> str | None:
+        """Get the type of a topic ('conversational' or 'dev')."""
+        return self.topic_types.get(self._topic_key(chat_id, thread_id))
+
+    def iter_topic_bindings(self) -> Iterator[tuple[int, int | None, str]]:
+        """Iterate topic bindings as (chat_id, thread_id, window_id).
+
+        thread_id=0 is returned as None (General topic).
+        """
+        for key, window_id in self.topic_bindings.items():
+            chat_id_str, thread_id_str = key.split(":", 1)
+            tid = int(thread_id_str)
+            yield int(chat_id_str), tid if tid != 0 else None, window_id
+
+    async def find_topics_for_session(
+        self,
+        session_id: str,
+    ) -> list[tuple[int, int | None, str]]:
+        """Find topic bindings whose window maps to the given session_id.
+
+        Returns list of (chat_id, thread_id, window_id) tuples.
+        """
+        result: list[tuple[int, int | None, str]] = []
+        for chat_id, thread_id, window_id in self.iter_topic_bindings():
+            resolved = await self.resolve_session_for_window(window_id)
+            if resolved and resolved.session_id == session_id:
+                result.append((chat_id, thread_id, window_id))
+        return result
 
     async def find_users_for_session(
         self,

@@ -67,27 +67,47 @@ class Config:
         self.session_map_file = self.config_dir / "session_map.json"
         self.monitor_state_file = self.config_dir / "monitor_state.json"
 
-        # --- Multi-project group routing ---
-        # PROJECT_GROUPS: JSON mapping project name → Telegram group chat_id
-        # e.g. {"france-2026": -100123, "outstanding": -100456}
+        # --- Group routing ---
         # PROJECTS_DIR: base directory for projects (default ~/dev/@active)
         self.projects_dir = Path(
             os.getenv("CCBOT_PROJECTS_DIR", str(Path.home() / "dev" / "@active"))
         )
-        groups_json = os.getenv("PROJECT_GROUPS", "{}")
+
+        # CONVERSATIONAL_GROUPS: project_name → chat_id (per-project, multi-user)
+        conv_json = os.getenv("CONVERSATIONAL_GROUPS", "{}")
         try:
-            raw_groups = json.loads(groups_json)
-            self.project_groups: dict[str, int] = {
-                str(k): int(v) for k, v in raw_groups.items()
+            raw_conv = json.loads(conv_json)
+            self.conversational_groups: dict[str, int] = {
+                str(k): int(v) for k, v in raw_conv.items()
             }
         except (json.JSONDecodeError, ValueError) as e:
-            logger.warning("Failed to parse PROJECT_GROUPS: %s", e)
-            self.project_groups = {}
+            logger.warning("Failed to parse CONVERSATIONAL_GROUPS: %s", e)
+            self.conversational_groups = {}
 
-        # Reverse mapping: group_chat_id → project name
-        self.group_to_project: dict[int, str] = {
-            v: k for k, v in self.project_groups.items()
+        # Reverse: chat_id → project name (conversational groups only)
+        self._conv_group_to_project: dict[int, str] = {
+            v: k for k, v in self.conversational_groups.items()
         }
+
+        # DEV_GROUP: single chat_id for the dev group (all projects, Sam only)
+        dev_group_str = os.getenv("DEV_GROUP", "")
+        self.dev_group: int | None = int(dev_group_str) if dev_group_str else None
+
+        # DEV_USERS: comma-separated user IDs who can use dev group and $accept
+        dev_users_str = os.getenv("DEV_USERS", "")
+        self.dev_users: set[int] = (
+            {int(uid.strip()) for uid in dev_users_str.split(",") if uid.strip()}
+            if dev_users_str
+            else set()
+        )
+
+        # Whether user-created topics in dev group are conversational
+        self.dev_group_user_topics = os.getenv(
+            "DEV_GROUP_USER_TOPICS", "conversational"
+        )
+
+        # Backward compat: combined project→group mapping for project_for_cwd
+        self.project_groups: dict[str, int] = dict(self.conversational_groups)
 
         # Claude Code session monitoring configuration
         # Support custom projects path for Claude variants (e.g., cc-mirror, zai)
@@ -134,11 +154,14 @@ class Config:
 
         logger.debug(
             "Config initialized: dir=%s, token=%s..., allowed_users=%d, "
-            "project_groups=%s, claude_projects_path=%s",
+            "conversational_groups=%s, dev_group=%s, dev_users=%s, "
+            "claude_projects_path=%s",
             self.config_dir,
             self.telegram_bot_token[:8],
             len(self.allowed_users),
-            list(self.project_groups.keys()),
+            list(self.conversational_groups.keys()),
+            self.dev_group,
+            self.dev_users,
             self.claude_projects_path,
         )
 
@@ -151,8 +174,20 @@ class Config:
         return self.projects_dir / project_name
 
     def project_for_group(self, chat_id: int) -> str | None:
-        """Look up the project name for a Telegram group chat_id."""
-        return self.group_to_project.get(chat_id)
+        """Look up the project name for a group chat_id (conversational groups)."""
+        return self._conv_group_to_project.get(chat_id)
+
+    def is_conversational_group(self, chat_id: int) -> bool:
+        """Check if a chat_id is a conversational group."""
+        return chat_id in self._conv_group_to_project
+
+    def is_dev_group(self, chat_id: int) -> bool:
+        """Check if a chat_id is the dev group."""
+        return self.dev_group is not None and chat_id == self.dev_group
+
+    def is_dev_user(self, user_id: int) -> bool:
+        """Check if a user can use the dev group and $accept plans."""
+        return user_id in self.dev_users
 
     def project_for_cwd(self, cwd: str) -> str | None:
         """Look up the project name for a cwd path.

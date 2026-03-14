@@ -88,10 +88,6 @@ class TestStatusPollerSettingsDetection:
                 "ccbot.handlers.status_polling.handle_interactive_ui",
                 new_callable=AsyncMock,
             ) as mock_handle_ui,
-            patch(
-                "ccbot.handlers.status_polling.enqueue_status_update",
-                new_callable=AsyncMock,
-            ),
         ):
             mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
             mock_tmux.capture_pane = AsyncMock(return_value=normal_pane)
@@ -100,6 +96,7 @@ class TestStatusPollerSettingsDetection:
                 mock_bot, user_id=1, window_id=window_id, thread_id=42
             )
 
+            # Status lines are suppressed; only interactive UIs trigger handle_interactive_ui
             mock_handle_ui.assert_not_called()
 
     @pytest.mark.asyncio

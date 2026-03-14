@@ -277,6 +277,12 @@ src/ccbot/
     └── status_polling.py  # Terminal status line polling
 ```
 
+## Documentation
+
+- [Architecture](docs/architecture.md) — system diagram, module inventory, key design decisions
+- [Topic Architecture](docs/topic-architecture.md) — conversational vs dev topics, binding models, message flows
+- [Message Handling](docs/message-handling.md) — message queue, merging, rate limiting, status handling
+
 ## Contributors
 
 Thanks to all the people who contribute! We encourage using Claude Code to collaborate on contributions.

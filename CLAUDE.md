@@ -19,15 +19,16 @@ After modifying any source file under `src/ccbot/`, you MUST run `dev bot restar
 ## Core Design Constraints
 
 - **Session-per-instance** — each Claude instance gets its own tmux session (not a window inside a shared session). Sessions are discoverable by `dev go` and attachable from the terminal.
-- **1 Topic = 1 Session** — all internal routing keyed by tmux window ID (`@0`, `@12`), globally unique across sessions. Window names kept as display names.
-- **Multi-group project routing** — one Telegram supergroup per project. `PROJECT_GROUPS` env var maps project names to group chat IDs. Unbound topics in a project group auto-create sessions in the project directory.
-- **Topic-only** — no backward-compat for non-topic mode. No `active_sessions`, no `/list`, no General topic routing.
+- **Two topic types** — Conversational topics (human-created, multi-user, `topic_bindings`) and Dev session topics (bot-created, 1:1 with tmux, `thread_bindings`). All internal routing keyed by tmux window ID (`@0`, `@12`).
+- **Two group types** — Conversational groups (`CONVERSATIONAL_GROUPS`, per-project, multi-user) and Dev group (`DEV_GROUP`, single, DEV_USERS only). User-created topics are always conversational.
+- **Safety through workflow** — conversational sessions run with `--dangerously-skip-permissions` (read + plan freely). Code changes only happen after plan acceptance in a dedicated worktree session.
 - **No message truncation** at parse layer — splitting only at send layer (`split_message`, 4096 char limit).
 - **MarkdownV2 only** — use `safe_reply`/`safe_edit`/`safe_send` helpers (auto fallback to plain text). Internal queue/UI code calls bot API directly with its own fallback.
 - **Hook-based session tracking** — `SessionStart` hook writes `session_map.json`; monitor polls it to detect session changes.
-- **Message queue per user** — FIFO ordering, message merging (3800 char limit), tool_use/tool_result pairing.
+- **Message queue per user** — FIFO ordering, message merging (3800 char limit), tool_use/tool_result pairing. For conversational topics, queue key is the group chat_id.
 - **Rate limiting** — `AIORateLimiter(max_retries=5)` on the Application (30/s global). On restart, the global bucket is pre-filled to avoid burst against Telegram's server-side counter.
-- **Proactive reminders** — background monitor reads `work/waiting-for.md` per project, sends reminders to the Reminders topic with reschedule/done buttons.
+- **Proactive reminders** — background monitor reads `work/waiting-for.md` per project, sends reminders to the General topic with reschedule/done buttons.
+- **Status suppressed** — no status line messages forwarded to Telegram. Only conversational content and interactive UIs.
 
 ## Code Conventions
 
@@ -39,7 +40,10 @@ After modifying any source file under `src/ccbot/`, you MUST run `dev bot restar
 - Config directory: `~/.ccbot/` by default, override with `CCBOT_DIR` env var.
 - `.env` loading priority: local `.env` > config dir `.env`.
 - State files: `state.json` (thread bindings), `session_map.json` (hook-generated), `monitor_state.json` (byte offsets), `reminder_state.json` (reminder tracking).
-- `PROJECT_GROUPS` — JSON mapping project name → Telegram group chat ID. E.g. `{"france-2026": -100123, "outstanding": -100456}`
+- `CONVERSATIONAL_GROUPS` — JSON mapping project name → Telegram group chat ID. E.g. `{"france-2026": -100123}`
+- `DEV_GROUP` — Telegram chat ID for the single dev group (all projects)
+- `DEV_USERS` — comma-separated user IDs who can use dev group and `$accept` plans
+- `DEV_GROUP_USER_TOPICS` — `"conversational"` (default) or `"dev"` for user-created topics in dev group
 - `CCBOT_PROJECTS_DIR` — base directory for projects (default `~/dev/@active`)
 - `REMINDER_INTERVAL` — seconds between reminder checks (default: 21600 = 6h)
 
@@ -62,6 +66,6 @@ Or manually in `~/.claude/settings.json`:
 
 ## Architecture Details
 
-See @.claude/references/architecture.md for full system diagram and module inventory.
-See @.claude/references/topic-architecture.md for topic→window→session mapping details.
-See @.claude/references/message-handling.md for message queue, merging, and rate limiting.
+See @docs/architecture.md for full system diagram and module inventory.
+See @docs/topic-architecture.md for topic→window→session mapping details.
+See @docs/message-handling.md for message queue, merging, and rate limiting.

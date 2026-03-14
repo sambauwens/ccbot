@@ -47,7 +47,11 @@ def main() -> None:
 
     logger.info("Allowed users: %s", config.allowed_users)
     logger.info("Claude projects path: %s", config.claude_projects_path)
-    logger.info("Project groups: %s", config.project_groups)
+    logger.info(
+        "Conversational groups: %s, Dev group: %s",
+        config.conversational_groups,
+        config.dev_group,
+    )
 
     logger.info("Starting Telegram bot...")
     from .bot import create_bot

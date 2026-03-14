@@ -24,7 +24,7 @@ from telegram import Bot
 from telegram.error import BadRequest
 
 from ..session import session_manager
-from ..terminal_parser import is_interactive_ui, parse_status_line
+from ..terminal_parser import is_interactive_ui
 from ..tmux_manager import tmux_manager
 from .interactive_ui import (
     clear_interactive_msg,
@@ -32,7 +32,6 @@ from .interactive_ui import (
     handle_interactive_ui,
 )
 from .cleanup import clear_topic_state
-from .message_queue import enqueue_status_update, get_message_queue
 
 logger = logging.getLogger(__name__)
 
@@ -48,24 +47,14 @@ async def update_status_message(
     user_id: int,
     window_id: str,
     thread_id: int | None = None,
-    skip_status: bool = False,
 ) -> None:
-    """Poll terminal and check for interactive UIs and status updates.
+    """Poll terminal for interactive UIs (permission prompts, questions).
 
-    UI detection always happens regardless of skip_status. When skip_status=True,
-    only UI detection runs (used when message queue is non-empty to avoid
-    flooding the queue with status updates).
-
-    Also detects permission prompt UIs (not triggered via JSONL) and enters
-    interactive mode when found.
+    Status line messages are suppressed — the bot only forwards conversational
+    content (text responses and interactive UIs).
     """
     w = await tmux_manager.find_window_by_id(window_id)
     if not w:
-        # Window gone, enqueue clear (unless skipping status)
-        if not skip_status:
-            await enqueue_status_update(
-                bot, user_id, window_id, None, thread_id=thread_id
-            )
         return
 
     pane_text = await tmux_manager.capture_pane(w.window_id)
@@ -102,21 +91,8 @@ async def update_status_message(
         await handle_interactive_ui(bot, user_id, window_id, thread_id)
         return
 
-    # Normal status line check — skip if queue is non-empty
-    if skip_status:
-        return
-
-    status_line = parse_status_line(pane_text)
-
-    if status_line:
-        await enqueue_status_update(
-            bot,
-            user_id,
-            window_id,
-            status_line,
-            thread_id=thread_id,
-        )
-    # If no status line, keep existing status message (don't clear on transient state)
+    # Status line messages suppressed — bot is conversational only
+    # (interactive UIs above are still detected and forwarded)
 
 
 async def status_poll_loop(bot: Bot) -> None:
@@ -174,7 +150,7 @@ async def status_poll_loop(bot: Bot) -> None:
                         chat_id = session_manager.resolve_chat_id(user_id, thread_id)
                         from ..config import config
 
-                        if config.project_for_group(chat_id):
+                        if config.is_conversational_group(chat_id) or config.is_dev_group(chat_id):
                             try:
                                 await bot.close_forum_topic(
                                     chat_id=chat_id,
@@ -197,18 +173,11 @@ async def status_poll_loop(bot: Bot) -> None:
                         )
                         continue
 
-                    # UI detection happens unconditionally in update_status_message.
-                    # Status enqueue is skipped inside update_status_message when
-                    # interactive UI is detected (returns early) or when queue is non-empty.
-                    queue = get_message_queue(user_id)
-                    skip_status = queue is not None and not queue.empty()
-
                     await update_status_message(
                         bot,
                         user_id,
                         wid,
                         thread_id=thread_id,
-                        skip_status=skip_status,
                     )
                 except Exception as e:
                     logger.debug(

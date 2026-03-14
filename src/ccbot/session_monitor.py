@@ -45,6 +45,7 @@ class NewSession:
     session_id: str
     cwd: str
     window_name: str
+    tmux_session_name: str
 
 
 @dataclass
@@ -406,7 +407,8 @@ class SessionMonitor:
         (e.g. "france-2026:@12"). All entries are processed regardless of
         tmux session name (session-per-instance model).
 
-        Returns dict of window_key -> {"session_id", "cwd", "window_name"}.
+        Returns dict of window_key -> {"session_id", "cwd", "window_name",
+        "tmux_session_name"}.
         """
         window_map: dict[str, dict[str, str]] = {}
         if config.session_map_file.exists():
@@ -415,19 +417,23 @@ class SessionMonitor:
                     content = await f.read()
                 session_map = json.loads(content)
                 for key, info in session_map.items():
-                    # Extract window_id from key (format: "session_name:@id")
+                    # Extract window_id and session name from key
+                    # (format: "session_name:@id")
                     idx = key.rfind(":@")
                     if idx < 0:
                         # Old format or unrecognized — use whole key
                         window_key = key
+                        tmux_session_name = ""
                     else:
                         window_key = key[idx + 1 :]
+                        tmux_session_name = key[:idx]
                     session_id = info.get("session_id", "")
                     if session_id:
                         window_map[window_key] = {
                             "session_id": session_id,
                             "cwd": info.get("cwd", ""),
                             "window_name": info.get("window_name", ""),
+                            "tmux_session_name": tmux_session_name,
                         }
             except (json.JSONDecodeError, OSError):
                 pass
@@ -507,6 +513,7 @@ class SessionMonitor:
                             session_id=info["session_id"],
                             cwd=info["cwd"],
                             window_name=info["window_name"],
+                            tmux_session_name=info["tmux_session_name"],
                         )
                     )
                 except Exception as e:

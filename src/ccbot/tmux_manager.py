@@ -245,15 +245,28 @@ class TmuxManager:
         return await asyncio.to_thread(_sync_send_keys)
 
     async def rename_window(self, window_id: str, new_name: str) -> bool:
-        """Rename a tmux window by its ID."""
+        """Rename a tmux session (and its window) by window ID.
+
+        In session-per-instance mode each session has one window,
+        so renaming the session is what makes it discoverable via `dev go`.
+        """
 
         def _sync_rename() -> bool:
             window = self._find_window(window_id)
             if not window:
                 return False
             try:
-                window.rename_window(new_name)
-                logger.info("Renamed window %s to '%s'", window_id, new_name)
+                session = window.session
+                if session:
+                    session.rename_session(new_name)
+                    logger.info(
+                        "Renamed session for window %s to '%s'",
+                        window_id,
+                        new_name,
+                    )
+                else:
+                    window.rename_window(new_name)
+                    logger.info("Renamed window %s to '%s'", window_id, new_name)
                 return True
             except Exception as e:
                 logger.error("Failed to rename window %s: %s", window_id, e)
@@ -297,6 +310,7 @@ class TmuxManager:
         window_name: str | None = None,
         start_claude: bool = True,
         resume_session_id: str | None = None,
+        skip_permissions: bool = False,
     ) -> tuple[bool, str, str, str]:
         """Create a new tmux session and optionally start Claude Code.
 
@@ -308,6 +322,7 @@ class TmuxManager:
             window_name: Session/window name (defaults to directory name)
             start_claude: Whether to start claude command
             resume_session_id: If set, append --resume <id> to claude command
+            skip_permissions: If True, add --dangerously-skip-permissions
 
         Returns:
             Tuple of (success, message, session_name, window_id)
@@ -371,6 +386,8 @@ class TmuxManager:
                         from .config import config
 
                         cmd = config.claude_command
+                        if skip_permissions:
+                            cmd = f"{cmd} --dangerously-skip-permissions"
                         if resume_session_id:
                             cmd = f"{cmd} --resume {resume_session_id}"
                         pane.send_keys(cmd, enter=True)
