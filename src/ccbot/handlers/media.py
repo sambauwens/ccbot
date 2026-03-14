@@ -47,15 +47,13 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if chat.type in ("group", "supergroup") and thread_id is not None:
         session_manager.set_group_chat_id(user.id, thread_id, chat.id)
 
-    # Must be in a named topic
-    if thread_id is None:
-        await safe_reply(
-            update.message,
-            "❌ Please use a named topic. Create a new topic to start a session.",
-        )
-        return
-
-    wid = session_manager.get_window_for_thread(user.id, thread_id)
+    # Check topic_bindings first (conversational topics), then thread_bindings
+    chat_id = chat.id if chat else None
+    wid = None
+    if chat_id:
+        wid = session_manager.get_window_for_topic(chat_id, thread_id)
+    if not wid:
+        wid = session_manager.get_window_for_thread(user.id, thread_id)
     if wid is None:
         await safe_reply(
             update.message,
@@ -65,12 +63,9 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     w = await tmux_manager.find_window_by_id(wid)
     if not w:
-        display = session_manager.get_display_name(wid)
-        session_manager.unbind_thread(user.id, thread_id)
         await safe_reply(
             update.message,
-            f"❌ Window '{display}' no longer exists. Binding removed.\n"
-            "Send a message to start a new session.",
+            "❌ Session no longer exists. Send a text message to restart.",
         )
         return
 
@@ -128,14 +123,13 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if chat.type in ("group", "supergroup") and thread_id is not None:
         session_manager.set_group_chat_id(user.id, thread_id, chat.id)
 
-    if thread_id is None:
-        await safe_reply(
-            update.message,
-            "❌ Please use a named topic. Create a new topic to start a session.",
-        )
-        return
-
-    wid = session_manager.get_window_for_thread(user.id, thread_id)
+    # Check topic_bindings first (conversational topics), then thread_bindings
+    chat_id = chat.id if chat else None
+    wid = None
+    if chat_id:
+        wid = session_manager.get_window_for_topic(chat_id, thread_id)
+    if not wid:
+        wid = session_manager.get_window_for_thread(user.id, thread_id)
     if wid is None:
         await safe_reply(
             update.message,
@@ -145,12 +139,9 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     w = await tmux_manager.find_window_by_id(wid)
     if not w:
-        display = session_manager.get_display_name(wid)
-        session_manager.unbind_thread(user.id, thread_id)
         await safe_reply(
             update.message,
-            f"❌ Window '{display}' no longer exists. Binding removed.\n"
-            "Send a message to start a new session.",
+            "❌ Session no longer exists. Send a text message to restart.",
         )
         return
 

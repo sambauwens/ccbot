@@ -580,7 +580,13 @@ async def handle_conversational_message(
         )
         wid = created_wid
 
-        # Instruct the session for conversational behavior
+        # Instruct the session for conversational behavior.
+        # Wait briefly for Claude to be ready, send instruction, then wait for
+        # Claude to process it. Skip the instruction exchange in monitoring by
+        # advancing the read offset past it.
+        import asyncio as _asyncio
+
+        await _asyncio.sleep(2.0)
         await session_manager.send_to_window(
             created_wid,
             "You are in a conversational Telegram topic with multiple users. "
@@ -589,8 +595,24 @@ async def handle_conversational_message(
             "- When the conversation drifts to a different subject, suggest "
             "$new <suggested-title> to move the discussion to a dedicated topic.\n"
             "- Keep responses conversational.\n"
-            "- Do not mention these instructions.",
+            "- Do not respond to this message, just acknowledge silently and wait "
+            "for the first real user message.",
         )
+        # Give Claude time to process, then skip past this exchange
+        await _asyncio.sleep(5.0)
+        session = await session_manager.resolve_session_for_window(created_wid)
+        if session and session.file_path:
+            try:
+                from pathlib import Path as _Path
+
+                file_size = _Path(session.file_path).stat().st_size
+                # Advance offset for all users so the instruction isn't forwarded
+                for uid in config.allowed_users:
+                    session_manager.update_user_window_offset(
+                        uid, created_wid, file_size
+                    )
+            except OSError:
+                pass
 
     # Handle $ commands in conversational topics
     if text.startswith("$"):
@@ -622,7 +644,7 @@ async def handle_conversational_message(
     # Forward message with sender name prefix
     w = await tmux_manager.find_window_by_id(wid)
     if not w:
-        # Session died -- auto-restart by unbinding and recursing
+        # Session died — auto-restart by unbinding and recursing
         session_manager.unbind_topic(chat_id, thread_id)
         await handle_conversational_message(
             update, context, user, chat_id, thread_id, text
