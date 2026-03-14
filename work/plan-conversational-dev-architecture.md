@@ -266,25 +266,16 @@ topic_types: dict[str, str]     # "chat_id:thread_id" → "conversational" | "de
 - [x] Claude instruction to suggest `$plan` when changes seem needed
 - [x] `$new` command (create topic, carry context)
 
-### Phase 5: Polish
-- [ ] Subject change detection (AI-based, suggests $new with title)
-- [ ] GitHub links for referenced files in conversational topics
-- [ ] Auto-restart idle conversational sessions (kill + resume on next message)
-- [ ] Dev session completion → notification to source conversational topic
-- [ ] Reminder routing to General topic
-- [ ] Write `docs/retrospective.md` — reference doc for how to run retrospectives,
-      evolving over time. Covers: timeline reconstruction, Five Whys, blameless framing,
-      policies vs projects output format, evidence chains, session-explorer usage,
-      commit history analysis. Bot uses this to prompt Claude when triggering retros.
-- [ ] Auto-retrospective on plan completion: when a worktree is merged ($merge) or
-      detected as completed externally, the bot triggers a retrospective —
-      uses session-explorer to reconstruct the implementation timeline from the
-      worktree's Claude sessions, compares actual work vs claude instructions,
-      identifies what went wrong / well / could improve, and writes a
-      retrospective document to the project (policies + projects format).
-      Bot reads docs/retrospective.md to structure the retro prompt.
-      Should work for both bot-managed ($accept→$merge) and externally-started work.
-- [ ] Retrospective of THIS implementation (our current plan) — one-off, do when Phase 5 is done
+### Phase 5: Polish ✅
+- [x] Subject change detection (AI-based, suggests $new with title) — via session instruction
+- [x] GitHub links for referenced files — `_parse_github_url` + `_make_github_link` helpers
+- [x] Auto-restart idle conversational sessions (dead session auto-restarts on next message)
+- [x] Dev session completion → notification to source conversational topic (merge reminder)
+- [x] Reminder routing to General topic (removed Reminders topic, sends to General)
+- [x] Write `docs/retrospective.md` — reference doc with template
+- [x] Auto-retrospective on $merge — triggers retro prompt to conversational session
+- [x] Auto-retrospective on external completion — stale worktree monitor detects removed worktrees
+- [ ] Retrospective of THIS implementation (our current plan) — one-off, do now
 
 ## Verification
 

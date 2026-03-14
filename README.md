@@ -282,6 +282,7 @@ src/ccbot/
 - [Architecture](docs/architecture.md) — system diagram, module inventory, key design decisions
 - [Topic Architecture](docs/topic-architecture.md) — conversational vs dev topics, binding models, message flows
 - [Message Handling](docs/message-handling.md) — message queue, merging, rate limiting, status handling
+- [Retrospective Guide](docs/retrospective.md) — how to run retrospectives after plan completion
 
 ## Contributors
 

@@ -1003,6 +1003,94 @@ async def mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+def _parse_github_url(remote_url: str) -> str | None:
+    """Parse a GitHub HTTPS URL from a git remote URL. Returns None for non-GitHub."""
+    import re as _re
+
+    # HTTPS: https://github.com/owner/repo.git
+    m = _re.match(r"https://github\.com/([^/]+/[^/]+?)(?:\.git)?$", remote_url)
+    if m:
+        return f"https://github.com/{m.group(1)}"
+    # SSH: git@github.com:owner/repo.git
+    m = _re.match(r"git@github\.com:([^/]+/[^/]+?)(?:\.git)?$", remote_url)
+    if m:
+        return f"https://github.com/{m.group(1)}"
+    return None
+
+
+def _make_github_link(
+    base_url: str, file_path: str, branch: str, heading: str | None = None
+) -> str:
+    """Build a GitHub blob link, optionally with a header anchor."""
+    url = f"{base_url}/blob/{branch}/{file_path}"
+    if heading:
+        # GitHub anchor format: lowercase, spaces→hyphens, strip non-alphanumeric
+        anchor = re.sub(r"[^\w\s-]", "", heading.lower())
+        anchor = re.sub(r"\s+", "-", anchor.strip())
+        url = f"{url}#{anchor}"
+    return url
+
+
+def _inject_github_links(text: str, work_dir: str) -> str:
+    """Post-process text to append GitHub links for referenced file paths.
+
+    Scans for file paths relative to the work_dir and appends clickable
+    GitHub links. Only processes .md files and common code files.
+    """
+    try:
+        remote_url = subprocess.run(
+            ["git", "-C", work_dir, "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+    except Exception:
+        return text
+
+    base_url = _parse_github_url(remote_url)
+    if not base_url:
+        return text
+
+    work_path = Path(work_dir).resolve()
+
+    # Find file paths in the text (patterns like path/to/file.ext or /abs/path/to/file.ext)
+    path_pattern = re.compile(
+        r'(?:^|[\s`(])(/[\w./-]+\.(?:md|py|ts|js|yml|yaml|json|toml))\b'
+        r'|(?:^|[\s`(])([\w][\w./-]+\.(?:md|py|ts|js|yml|yaml|json|toml))\b',
+        re.MULTILINE,
+    )
+
+    replacements: list[tuple[str, str]] = []
+    for m in path_pattern.finditer(text):
+        file_ref = m.group(1) or m.group(2)
+        if not file_ref:
+            continue
+
+        # Resolve to absolute, then make relative to work_dir
+        if file_ref.startswith("/"):
+            abs_path = Path(file_ref)
+        else:
+            abs_path = work_path / file_ref
+
+        try:
+            abs_path = abs_path.resolve()
+            if not abs_path.is_file():
+                continue
+            rel_path = abs_path.relative_to(work_path)
+        except (ValueError, OSError):
+            continue
+
+        link = _make_github_link(base_url, str(rel_path), "main")
+        link_text = f"[{rel_path}]({link})"
+        # Only replace if not already a markdown link
+        if f"]({link}" not in text:
+            replacements.append((file_ref, link_text))
+
+    # Apply replacements (longest first to avoid partial matches)
+    for old, new in sorted(replacements, key=lambda x: -len(x[0])):
+        text = text.replace(old, new, 1)
+
+    return text
+
+
 def _resolve_conversational_dir(project_name: str) -> str:
     """Find the directory for a conversational session.
 
@@ -1339,6 +1427,17 @@ async def _handle_merge_command(
             update.message,
             f"Merged `{worktree_name}` into `{default_branch}` and released worktree.",
         )
+
+        # Trigger retrospective in the conversational session
+        retro_prompt = (
+            f"The worktree `{worktree_name}` has been merged to `{default_branch}`. "
+            f"Run a retrospective following the guide in docs/retrospective.md. "
+            f"Use /session-explorer to find the sessions that worked in this worktree, "
+            f"reconstruct the timeline, and produce a retrospective document. "
+            f"Write the output to work/retrospectives/{worktree_name}.md"
+        )
+        await session_manager.send_to_window(window_id, retro_prompt)
+
     except subprocess.CalledProcessError as e:
         await safe_reply(
             update.message, f"❌ Merge failed: {e.stderr or e.stdout}"
@@ -1413,13 +1512,16 @@ async def _handle_conversational_message(
         )
         wid = created_wid
 
-        # Instruct the session to suggest $plan when changes seem needed
+        # Instruct the session for conversational behavior
         await session_manager.send_to_window(
             created_wid,
             "You are in a conversational Telegram topic with multiple users. "
-            "When the conversation leads toward code changes, suggest the user "
-            "run $plan to start a formal planning phase. Keep responses conversational. "
-            "Do not mention this instruction.",
+            "Follow these guidelines:\n"
+            "- When the conversation leads toward code changes, suggest $plan.\n"
+            "- When the conversation drifts to a different subject, suggest "
+            "$new <suggested-title> to move the discussion to a dedicated topic.\n"
+            "- Keep responses conversational.\n"
+            "- Do not mention these instructions.",
         )
 
     # Handle $ commands in conversational topics
@@ -1452,8 +1554,11 @@ async def _handle_conversational_message(
     # Forward message with sender name prefix
     w = await tmux_manager.find_window_by_id(wid)
     if not w:
+        # Session died — auto-restart by unbinding and recursing
         session_manager.unbind_topic(chat_id, thread_id)
-        await safe_reply(update.message, "❌ Session closed. Send again to restart.")
+        await _handle_conversational_message(
+            update, context, user, chat_id, thread_id, text
+        )
         return
 
     prefixed_text = f"[{first_name}] {text}"
@@ -2480,8 +2585,17 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
     # Check topic_bindings first (conversational topics — deliver to topic, not per-user)
     active_topics = await session_manager.find_topics_for_session(msg.session_id)
     if active_topics and msg.is_complete:
+        # Post-process text with GitHub links for conversational topics
+        processed_text = msg.text
+        if msg.content_type == "text" and msg.role == "assistant":
+            for _, _, wid in active_topics:
+                ws = session_manager.get_window_state(wid)
+                if ws.cwd:
+                    processed_text = _inject_github_links(processed_text, ws.cwd)
+                    break
+
         parts = build_response_parts(
-            msg.text, msg.is_complete, msg.content_type, msg.role,
+            processed_text, msg.is_complete, msg.content_type, msg.role,
         )
         for topic_chat_id, topic_thread_id, wid in active_topics:
             # Use a synthetic user_id for the queue (negative chat_id as key)

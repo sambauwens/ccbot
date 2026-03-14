@@ -190,7 +190,6 @@ async def _send_reminders_for_project(
     project: str,
     group_chat_id: int,
     state: ReminderState,
-    reminders_topics: dict[int, int],
 ) -> None:
     """Check and send reminders for a single project."""
     from telegram import Bot
@@ -218,13 +217,7 @@ async def _send_reminders_for_project(
     if not to_remind:
         return
 
-    # Get or create Reminders topic
-    topic_id = reminders_topics.get(group_chat_id)
-    if topic_id is None:
-        topic_id = await _find_or_create_reminders_topic(bot, group_chat_id)
-        if topic_id is not None:
-            reminders_topics[group_chat_id] = topic_id
-
+    # Send reminders to the General topic (thread_id=None → no message_thread_id)
     for item in to_remind:
         overdue = (date.today() - item.due_date).days
         overdue_str = f" ({overdue}d overdue)" if overdue > 0 else ""
@@ -241,7 +234,6 @@ async def _send_reminders_for_project(
             await bot.send_message(
                 chat_id=group_chat_id,
                 text=text,
-                message_thread_id=topic_id,
                 reply_markup=keyboard,
             )
             state.mark_reminded(project, item)
@@ -287,8 +279,27 @@ async def _check_stale_worktrees(
 
     today = date.today()
 
+    removed_worktrees = []
     for wt_name, wt_info in worktrees.items():
         if wt_info.get("status") != "reserved":
+            continue
+
+        # Detect externally removed worktrees — trigger retrospective
+        wt_path = config.project_dir(project) / wt_name
+        if not wt_path.is_dir():
+            epic = wt_info.get("epic", wt_name)
+            try:
+                await bot.send_message(
+                    chat_id=group_chat_id,
+                    text=(
+                        f"Worktree `{wt_name}` was removed externally (epic: {epic}).\n"
+                        f"If the work is complete, consider running a retrospective."
+                    ),
+                )
+                removed_worktrees.append(wt_name)
+                logger.info("Detected externally removed worktree: %s", wt_name)
+            except Exception as e:
+                logger.error("Failed to notify about removed worktree: %s", e)
             continue
 
         # Check latest commit date in the worktree for staleness
@@ -337,12 +348,23 @@ async def _check_stale_worktrees(
         except Exception as e:
             logger.error("Failed to send worktree reminder: %s", e)
 
+    # Clean up removed worktrees from pool file
+    if removed_worktrees:
+        try:
+            import yaml
+
+            pool_data = yaml.safe_load(pool_file.read_text()) or {}
+            for wt_name in removed_worktrees:
+                pool_data.get("worktrees", {}).pop(wt_name, None)
+            pool_file.write_text(yaml.dump(pool_data, default_flow_style=False))
+            logger.info("Cleaned up %d removed worktrees from pool", len(removed_worktrees))
+        except Exception as e:
+            logger.warning("Failed to clean up pool file: %s", e)
+
 
 async def _reminder_loop(bot: object) -> None:
     """Background loop that checks waiting-for.md files periodically."""
     state = ReminderState()
-    # Cache Reminders topic IDs: group_chat_id → thread_id
-    reminders_topics: dict[int, int] = {}
 
     # Run immediately on startup, then at interval
     first_run = True
@@ -355,7 +377,7 @@ async def _reminder_loop(bot: object) -> None:
         for project, group_chat_id in config.conversational_groups.items():
             try:
                 await _send_reminders_for_project(
-                    bot, project, group_chat_id, state, reminders_topics
+                    bot, project, group_chat_id, state
                 )
             except Exception as e:
                 logger.error("Reminder check failed for %s: %s", project, e)
