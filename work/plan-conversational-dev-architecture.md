@@ -235,42 +235,42 @@ topic_types: dict[str, str]     # "chat_id:thread_id" → "conversational" | "de
 
 ## Implementation Phases
 
-### Phase 1: Config + Migration
-- New config: `CONVERSATIONAL_GROUPS`, `DEV_GROUP`, `DEV_USERS`, `DEV_GROUP_USER_TOPICS`
-- Create dev group (Telegram supergroup with forum topics)
-- Migrate france-2026: close all dev topics, keep General only
-- State reset (clear state.json, session_map.json)
-- Dev group General topic
+### Phase 1: Config + Migration ✅
+- [x] New config: `CONVERSATIONAL_GROUPS`, `DEV_GROUP`, `DEV_USERS`, `DEV_GROUP_USER_TOPICS`
+- [x] Create dev group (Telegram supergroup with forum topics)
+- [x] Migrate france-2026: close all dev topics, keep General only
+- [x] State reset (clear state.json, session_map.json)
+- [x] Dev group General topic
 
-### Phase 2: Conversational Topics
-- `topic_bindings` + `topic_types` in session.py
-- Conversational topic creation flow (auto-session in main branch worktree)
-- Multi-user messaging (sender name prefix, single delivery)
-- General topic handling (bot responds directly)
-- Subject change detection (AI-based, suggests $new with title)
-- `$new` command (create topic, carry context)
-- Access control (non-DEV_USERS blocked from dev group)
+### Phase 2: Conversational Topics ✅
+- [x] `topic_bindings` + `topic_types` in session.py
+- [x] Conversational topic creation flow (auto-session in main branch worktree)
+- [x] Multi-user messaging (sender name prefix, single delivery)
+- [x] General topic handling (bot responds directly)
+- [x] Access control (non-DEV_USERS blocked from dev group)
 
-### Phase 3: Dev Session Sync
-- Bidirectional tmux ↔ dev topic sync
-- Detect new tmux sessions → auto-create dev topic
-- Dev topic close → kill tmux session (existing)
-- Tmux session kill → close dev topic
-- Startup reconciliation (create missing topics, clean stale ones)
-- Remove `--dangerously-skip-permissions` default for dev sessions
+### Phase 3: Dev Session Sync ✅
+- [x] Bidirectional tmux ↔ dev topic sync
+- [x] Detect new tmux sessions → auto-create dev topic
+- [x] Dev topic close → kill tmux session (existing)
+- [x] Tmux session kill → close dev topic
+- [x] Startup reconciliation (create missing topics, clean stale ones)
+- [x] Remove `--dangerously-skip-permissions` default for dev sessions
 
 ### Phase 4: Planning Flow
-- `$plan` command (instructs Claude to enter planning mode)
-- `$accept` command (Sam only): extract plan → create worktree → write plan files → spawn dev session
-- Worktree creation (integrate with workspaces skill: pool file, naming, setup)
-- Dev session spawned in dev group with plan context
-- Claude instruction to suggest `$plan` when changes seem needed
+- [ ] `$plan` command (instructs Claude to enter planning mode)
+- [ ] `$accept` command (Sam only): extract plan → create worktree → write plan files → spawn dev session
+- [ ] Worktree creation (integrate with workspaces skill: pool file, naming, setup)
+- [ ] Dev session spawned in dev group with plan context
+- [ ] Claude instruction to suggest `$plan` when changes seem needed
+- [ ] `$new` command (create topic, carry context)
 
 ### Phase 5: Polish
-- GitHub links for referenced files in conversational topics
-- Auto-restart idle conversational sessions (kill + resume on next message)
-- Dev session completion → notification to source conversational topic
-- Reminder routing to General topic
+- [ ] Subject change detection (AI-based, suggests $new with title)
+- [ ] GitHub links for referenced files in conversational topics
+- [ ] Auto-restart idle conversational sessions (kill + resume on next message)
+- [ ] Dev session completion → notification to source conversational topic
+- [ ] Reminder routing to General topic
 
 ## Verification
 

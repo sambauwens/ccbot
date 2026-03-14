@@ -91,6 +91,9 @@ class SessionMonitor:
         self._new_session_callback: Callable[[NewSession], Awaitable[None]] | None = (
             None
         )
+        self._session_removed_callback: (
+            Callable[[str], Awaitable[None]] | None
+        ) = None  # Called with window_id when a window is deleted
         # Per-session pending tool_use state carried across poll cycles
         self._pending_tools: dict[str, dict[str, Any]] = {}  # session_id -> pending
         # Track last known session_map for detecting changes
@@ -108,6 +111,12 @@ class SessionMonitor:
         self, callback: Callable[[NewSession], Awaitable[None]]
     ) -> None:
         self._new_session_callback = callback
+
+    def set_session_removed_callback(
+        self, callback: Callable[[str], Awaitable[None]]
+    ) -> None:
+        """Set callback for when a window is deleted. Called with window_id."""
+        self._session_removed_callback = callback
 
     async def _get_active_cwds(self) -> set[str]:
         """Get normalized cwds of all active tmux windows."""
@@ -494,12 +503,20 @@ class SessionMonitor:
             )
             sessions_to_remove.add(old_info["session_id"])
 
-        # Perform cleanup
+        # Perform cleanup and notify about deleted windows
         if sessions_to_remove:
             for session_id in sessions_to_remove:
                 self.state.remove_session(session_id)
                 self._file_mtimes.pop(session_id, None)
             self.state.save_if_dirty()
+
+        deleted_windows = old_windows - current_windows
+        if deleted_windows and self._session_removed_callback:
+            for window_id in deleted_windows:
+                try:
+                    await self._session_removed_callback(window_id)
+                except Exception as e:
+                    logger.error("Session removed callback error: %s", e)
 
         # Detect new windows and notify callback
         new_windows = current_windows - old_windows

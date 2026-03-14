@@ -2258,6 +2258,97 @@ async def handle_new_session(session: NewSession, bot: Bot) -> None:
     )
 
 
+async def reconcile_dev_topics(bot: Bot) -> None:
+    """Startup reconciliation: create dev topics for tmux sessions without topics.
+
+    Reads session_map.json to find all active windows, checks which ones
+    are already bound, and creates dev topics for unbound ones.
+    """
+    if not config.dev_group:
+        return
+
+    session_map = session_manager.read_session_map_sync()
+    if not session_map:
+        return
+
+    # Collect all bound window IDs
+    bound_ids: set[str] = set()
+    for _, _, wid in session_manager.iter_thread_bindings():
+        bound_ids.add(wid)
+    for _, _, wid in session_manager.iter_topic_bindings():
+        bound_ids.add(wid)
+
+    created = 0
+    for map_key, info in session_map.items():
+        # map_key format: "tmux_session_name:@window_id"
+        if ":" not in map_key:
+            continue
+        tmux_session_name, window_id = map_key.rsplit(":", 1)
+        if window_id in bound_ids:
+            continue
+
+        # Use tmux session name as topic title
+        topic_title = tmux_session_name or info.get("window_name", "Session")
+
+        try:
+            forum_topic = await bot.create_forum_topic(
+                chat_id=config.dev_group, name=topic_title
+            )
+            new_thread_id = forum_topic.message_thread_id
+
+            for user_id in config.dev_users:
+                session_manager.set_group_chat_id(
+                    user_id, new_thread_id, config.dev_group
+                )
+                session_manager.bind_thread(
+                    user_id, new_thread_id, window_id,
+                    window_name=info.get("window_name", ""),
+                )
+
+            _topic_names[(config.dev_group, new_thread_id)] = topic_title
+            bound_ids.add(window_id)
+            created += 1
+            logger.info(
+                "Reconciled: created dev topic '%s' (thread=%d) for %s",
+                topic_title, new_thread_id, window_id,
+            )
+        except Exception as e:
+            logger.error("Failed to create dev topic for %s: %s", window_id, e)
+
+    if created:
+        logger.info("Reconciliation: created %d dev topics", created)
+
+
+async def handle_session_removed(window_id: str, bot: Bot) -> None:
+    """Handle a tmux session being killed — close the corresponding dev topic."""
+    if not config.dev_group:
+        return
+
+    # Find thread_bindings pointing to this window in the dev group
+    for user_id, thread_id, wid in list(session_manager.iter_thread_bindings()):
+        if wid != window_id:
+            continue
+        chat_id = session_manager.resolve_chat_id(user_id, thread_id)
+        if chat_id != config.dev_group:
+            continue
+
+        # Close the topic in the dev group
+        try:
+            await bot.close_forum_topic(
+                chat_id=config.dev_group, message_thread_id=thread_id
+            )
+            logger.info(
+                "Closed dev topic (thread=%d) for removed window %s",
+                thread_id,
+                window_id,
+            )
+        except Exception as e:
+            logger.debug("Failed to close dev topic: %s", e)
+
+        session_manager.unbind_thread(user_id, thread_id)
+        await clear_topic_state(user_id, thread_id, bot)
+
+
 # --- App lifecycle ---
 
 
@@ -2305,11 +2396,18 @@ async def post_init(application: Application) -> None:
     async def new_session_callback(session: NewSession) -> None:
         await handle_new_session(session, application.bot)
 
+    async def session_removed_callback(window_id: str) -> None:
+        await handle_session_removed(window_id, application.bot)
+
     monitor.set_message_callback(message_callback)
     monitor.set_new_session_callback(new_session_callback)
+    monitor.set_session_removed_callback(session_removed_callback)
     monitor.start()
     session_monitor = monitor
     logger.info("Session monitor started")
+
+    # Reconcile: create dev topics for tmux sessions without topics
+    await reconcile_dev_topics(application.bot)
 
     # Start status polling task
     _status_poll_task = asyncio.create_task(status_poll_loop(application.bot))

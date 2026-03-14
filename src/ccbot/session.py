@@ -514,6 +514,15 @@ class SessionManager:
             return key[idx + 1 :]
         return None
 
+    def read_session_map_sync(self) -> dict[str, dict[str, str]]:
+        """Read session_map.json synchronously and return raw data."""
+        if not config.session_map_file.exists():
+            return {}
+        try:
+            return json.loads(config.session_map_file.read_text())
+        except (json.JSONDecodeError, OSError):
+            return {}
+
     async def load_session_map(self) -> None:
         """Read session_map.json and update window_states with new session associations.
 
