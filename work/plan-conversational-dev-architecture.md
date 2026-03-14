@@ -262,6 +262,7 @@ topic_types: dict[str, str]     # "chat_id:thread_id" → "conversational" | "de
 - [ ] `$accept` command (Sam only): extract plan → create worktree → write plan files → spawn dev session
 - [ ] Worktree creation (integrate with workspaces skill: pool file, naming, setup)
 - [ ] Dev session spawned in dev group with plan context
+- [ ] On completion: merge worktree branch to main, release worktree
 - [ ] Claude instruction to suggest `$plan` when changes seem needed
 - [ ] `$new` command (create topic, carry context)
 
