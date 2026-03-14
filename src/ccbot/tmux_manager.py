@@ -311,6 +311,7 @@ class TmuxManager:
         start_claude: bool = True,
         resume_session_id: str | None = None,
         skip_permissions: bool = False,
+        allowed_tools: str | None = None,
     ) -> tuple[bool, str, str, str]:
         """Create a new tmux session and optionally start Claude Code.
 
@@ -323,6 +324,7 @@ class TmuxManager:
             start_claude: Whether to start claude command
             resume_session_id: If set, append --resume <id> to claude command
             skip_permissions: If True, add --dangerously-skip-permissions
+            allowed_tools: If set, add --allowedTools <tools> (overrides skip_permissions)
 
         Returns:
             Tuple of (success, message, session_name, window_id)
@@ -386,7 +388,9 @@ class TmuxManager:
                         from .config import config
 
                         cmd = config.claude_command
-                        if skip_permissions:
+                        if allowed_tools:
+                            cmd = f"{cmd} --allowedTools {allowed_tools}"
+                        elif skip_permissions:
                             cmd = f"{cmd} --dangerously-skip-permissions"
                         if resume_session_id:
                             cmd = f"{cmd} --resume {resume_session_id}"

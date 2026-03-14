@@ -352,7 +352,9 @@ async def _handle_new_command(
         tmux_name = f"{project_name}-{_sanitize_tmux_name(topic_title)}"
 
         success, message, created_name, created_wid = await tmux_manager.create_window(
-            work_dir, window_name=tmux_name, skip_permissions=True
+            work_dir,
+            window_name=tmux_name,
+            allowed_tools="Read,Glob,Grep,Agent,WebSearch,WebFetch,LSP"
         )
         if success:
             await session_manager.wait_for_session_map_entry(created_wid, timeout=5.0)
@@ -564,7 +566,9 @@ async def handle_conversational_message(
         )
 
         success, message, created_name, created_wid = await tmux_manager.create_window(
-            work_dir, window_name=tmux_name, skip_permissions=True
+            work_dir,
+            window_name=tmux_name,
+            allowed_tools="Read,Glob,Grep,Agent,WebSearch,WebFetch,LSP"
         )
         if not success:
             await safe_reply(update.message, f"❌ {message}")
