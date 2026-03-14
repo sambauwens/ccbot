@@ -77,11 +77,11 @@ Enable non-developers (Nathalie) to collaborate on projects through Telegram, wh
 
 | # | Story | Status | Details |
 |---|-------|--------|---------|
-| S1 | Conversational session permission lifecycle | needs rework | [→ story](stories/s1-permission-lifecycle/story.md) — The core: read-only by default, $plan elevates to full permissions, $accept delegates to worktree and returns to read-only |
-| S2 | Conversational topic as broker | needs rework | [→ story](stories/s2-conversational-broker/story.md) — Higher-order: not tied to a single session, spawns sessions, manages the lifecycle |
-| S3 | Dev session UX | done (needs review) | [→ story](stories/s3-dev-session-ux/story.md) — Input channel for terminal work: images, long messages, planning Q&A. Switch back to terminal. |
-| S4 | $plan → $accept → worktree flow | needs rework | [→ story](stories/s4-plan-accept-flow/story.md) — Full planning lifecycle with permission elevation, plan file creation, worktree + dev session spawning |
-| S5 | Subject change detection | done (needs review) | [→ story](stories/s5-subject-detection/story.md) — AI-based detection, suggests $new with title, not on every message |
-| S6 | Tmux bidirectional sync | done (needs review) | [→ story](stories/s6-tmux-sync/story.md) — Dev topics mirror tmux sessions, both directions |
-| S7 | Completion + retrospective | done (needs review) | [→ story](stories/s7-completion-retro/story.md) — $merge, stale reminders, auto-retrospective |
-| S8 | GitHub links in conversational topics | done (needs review) | [→ story](stories/s8-github-links/story.md) — Post-process responses with file links + header anchors |
+| S1 | Conversational session permission lifecycle | **needs rework** | [→ story](stories/s1-permission-lifecycle/story.md) — Read-only by default, $plan elevates to --dangerously-skip-permissions, $accept delegates to worktree and returns to read-only. Currently missing: $plan elevation kills/restarts session, $accept de-escalation not implemented, no permission state tracking. |
+| S2 | Conversational topic as broker | review needed | [→ story](stories/s2-conversational-broker/story.md) — Architecture docs need update. Code works but isn't documented as a broker model. |
+| S3 | Dev session UX | done | [→ story](stories/s3-dev-session-ux/story.md) — Input channel for terminal work. Photos, voice, text all forward to tmux. |
+| S4 | $plan → $accept → worktree flow | **needs rework** | [→ story](stories/s4-plan-accept-flow/story.md) — Depends on S1. $accept asks conversational Claude to write plan but session will be read-only after de-escalation. Need to write plan BEFORE de-escalating. |
+| S5 | Subject change detection | done (needs testing) | [→ story](stories/s5-subject-detection/story.md) — Via session instruction. Untested whether Claude actually suggests $new/$plan in practice. |
+| S6 | Tmux bidirectional sync | done | [→ story](stories/s6-tmux-sync/story.md) — Full bidirectional sync working: create/close either side, startup reconciliation. |
+| S7 | Completion + retrospective | done (one gap) | [→ story](stories/s7-completion-retro/story.md) — $merge, stale reminders, auto-retro all work. Gap: _worktree_sources not persisted across restart. |
+| S8 | GitHub links | done (gaps) | [→ story](stories/s8-github-links/story.md) — Basic link injection works. Gaps: header anchors not matched, remote URL not cached. |
