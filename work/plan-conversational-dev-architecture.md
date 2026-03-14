@@ -275,7 +275,7 @@ topic_types: dict[str, str]     # "chat_id:thread_id" → "conversational" | "de
 - [x] Write `docs/retrospective.md` — reference doc with template
 - [x] Auto-retrospective on $merge — triggers retro prompt to conversational session
 - [x] Auto-retrospective on external completion — stale worktree monitor detects removed worktrees
-- [ ] Retrospective of THIS implementation (our current plan) — one-off, do now
+- [x] Retrospective of THIS implementation → work/retrospectives/conversational-dev-architecture.md
 
 ## Verification
 
