@@ -77,7 +77,7 @@ Enable non-developers (Nathalie) to collaborate on projects through Telegram, wh
 
 | # | Story | Status | Details |
 |---|-------|--------|---------|
-| S1 | Conversational session permission lifecycle | ✅ done | [→ story](stories/s1-permission-lifecycle/story.md) — Read-only by default, $plan elevates via kill+restart+resume, $accept de-escalates back. Permission state persisted. |
+| S1 | Conversational session permission lifecycle | **needs rearchitect** | [→ story](stories/s1-permission-lifecycle/story.md) — [architectural analysis](stories/s1-permission-lifecycle/architectural-analysis.md) identified 5 fundamental issues. Key fix: use `--append-system-prompt` instead of fake user messages, make creation non-blocking, separate conversational delivery path. |
 | S2 | Conversational topic as broker | ✅ done | [→ story](stories/s2-conversational-broker/story.md) — Documented as broker model. Code uses topic_bindings (per-topic, not per-session). |
 | S3 | Dev session UX | ✅ done | [→ story](stories/s3-dev-session-ux/story.md) — Input channel for terminal work. Photos, voice, text all forward to tmux. |
 | S4 | $plan → $accept → worktree flow | ✅ done | [→ story](stories/s4-plan-accept-flow/story.md) — Plan written while elevated, then de-escalation to read-only. Worktree creation, pool update, dev session spawning all work. |
