@@ -373,10 +373,14 @@ class SessionMonitor:
                 else:
                     self._pending_tools.pop(session_info.session_id, None)
 
+                # Filter and collect messages, keeping only the last
+                # assistant text in a batch (skip intermediate narration)
+                batch_messages: list[NewMessage] = []
+                last_assistant_text_idx: int | None = None
+
                 for entry in parsed_entries:
                     if not entry.text and not entry.image_data:
                         continue
-                    # Skip user messages unless show_user_messages is enabled
                     if entry.role == "user" and not config.show_user_messages:
                         continue
                     if entry.content_type == "thinking" and not config.show_thinking:
@@ -386,18 +390,30 @@ class SessionMonitor:
                         and not config.show_tool_messages
                     ):
                         continue
-                    new_messages.append(
-                        NewMessage(
-                            session_id=session_info.session_id,
-                            text=entry.text,
-                            is_complete=True,
-                            content_type=entry.content_type,
-                            tool_use_id=entry.tool_use_id,
-                            role=entry.role,
-                            tool_name=entry.tool_name,
-                            image_data=entry.image_data,
-                        )
+                    msg = NewMessage(
+                        session_id=session_info.session_id,
+                        text=entry.text,
+                        is_complete=True,
+                        content_type=entry.content_type,
+                        tool_use_id=entry.tool_use_id,
+                        role=entry.role,
+                        tool_name=entry.tool_name,
+                        image_data=entry.image_data,
                     )
+                    batch_messages.append(msg)
+                    if entry.role == "assistant" and entry.content_type == "text":
+                        last_assistant_text_idx = len(batch_messages) - 1
+
+                # Only keep the last assistant text message in the batch
+                # (skip intermediate narration, keep interactive UIs and other types)
+                for i, msg in enumerate(batch_messages):
+                    if (
+                        msg.role == "assistant"
+                        and msg.content_type == "text"
+                        and i != last_assistant_text_idx
+                    ):
+                        continue
+                    new_messages.append(msg)
 
                 self.state.update_session(tracked)
 

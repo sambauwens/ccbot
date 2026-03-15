@@ -24,6 +24,20 @@ from .message_sender import safe_reply
 
 logger = logging.getLogger(__name__)
 
+
+def _append_telegram_wait(text: str, wid: str) -> str:
+    """Append wait instruction for dev session messages from Telegram."""
+    # Only for dev session topics (thread_bindings), not conversational (topic_bindings)
+    # Check: if this window is in a topic_binding, it's conversational — don't add wait
+    for _, _, bound_wid in session_manager.iter_topic_bindings():
+        if bound_wid == wid:
+            return text
+    return (
+        f"{text}\n\n"
+        "(This message was sent from Telegram. After processing, "
+        "wait for the user to return to terminal before taking further action.)"
+    )
+
 # --- Image directory for incoming photos ---
 _IMAGES_DIR = ccbot_dir() / "images"
 _IMAGES_DIR.mkdir(parents=True, exist_ok=True)
@@ -89,12 +103,13 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     clear_status_msg_info(user.id, thread_id)
 
     session_manager.mark_telegram_input(wid)
-    success, message = await session_manager.send_to_window(wid, text_to_send)
+    success, message = await session_manager.send_to_window(
+        wid, _append_telegram_wait(text_to_send, wid)
+    )
     if not success:
         await safe_reply(update.message, f"❌ {message}")
         return
 
-    # Confirm to user
     await safe_reply(update.message, "📷 Image sent to Claude Code.")
 
 
@@ -165,7 +180,9 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     clear_status_msg_info(user.id, thread_id)
 
     session_manager.mark_telegram_input(wid)
-    success, message = await session_manager.send_to_window(wid, text)
+    success, message = await session_manager.send_to_window(
+        wid, _append_telegram_wait(text, wid)
+    )
     if not success:
         await safe_reply(update.message, f"❌ {message}")
         return
