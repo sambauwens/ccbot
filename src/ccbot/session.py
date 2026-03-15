@@ -121,6 +121,9 @@ class SessionManager:
     # Worktree → source topic mapping (for merge reminders)
     # worktree_name → "chat_id:thread_id"
     worktree_sources: dict[str, str] = field(default_factory=dict)
+    # Last session_id per topic (for --resume on restart)
+    # "chat_id:thread_id" → session_id
+    topic_last_sessions: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self._load_state()
@@ -141,6 +144,7 @@ class SessionManager:
             "topic_types": self.topic_types,
             "topic_permission_states": self.topic_permission_states,
             "worktree_sources": self.worktree_sources,
+            "topic_last_sessions": self.topic_last_sessions,
         }
         atomic_write_json(config.state_file, state)
         logger.debug("State saved to %s", config.state_file)
@@ -178,6 +182,7 @@ class SessionManager:
                 self.topic_types = state.get("topic_types", {})
                 self.topic_permission_states = state.get("topic_permission_states", {})
                 self.worktree_sources = state.get("worktree_sources", {})
+                self.topic_last_sessions = state.get("topic_last_sessions", {})
 
                 # Detect old format: keys that don't look like window IDs
                 needs_migration = False
@@ -857,11 +862,18 @@ class SessionManager:
         )
 
     def unbind_topic(self, chat_id: int, thread_id: int | None) -> str | None:
-        """Remove a topic binding. Returns the previously bound window_id, or None."""
+        """Remove a topic binding. Returns the previously bound window_id, or None.
+
+        Saves the session_id for --resume on next session creation.
+        """
         key = self._topic_key(chat_id, thread_id)
         window_id = self.topic_bindings.pop(key, None)
         self.topic_types.pop(key, None)
         if window_id:
+            # Save session_id for --resume
+            ws = self.window_states.get(window_id)
+            if ws and ws.session_id:
+                self.topic_last_sessions[key] = ws.session_id
             self._save_state()
             logger.info("Unbound topic %s (was %s)", key, window_id)
         return window_id

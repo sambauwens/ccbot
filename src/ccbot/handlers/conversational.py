@@ -682,9 +682,15 @@ async def handle_conversational_message(
         )
 
         # Check for resume_session_id from auto-restart
+        # Check for resume: auto-restart stores it in user_data, or use persisted last session
         resume_id = None
         if context.user_data:
             resume_id = context.user_data.pop("_conv_resume_session_id", None)
+        if not resume_id:
+            topic_key = session_manager._topic_key(chat_id, thread_id)
+            resume_id = session_manager.topic_last_sessions.pop(topic_key, None)
+            if resume_id:
+                session_manager._save_state()
 
         # Respect persisted permission state (e.g., $plan was active before restart)
         perm_state = session_manager.get_topic_permission(chat_id, thread_id)
