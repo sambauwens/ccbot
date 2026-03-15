@@ -275,7 +275,7 @@ async def _handle_accept_command(
 
     Only DEV_USERS can accept plans.
     """
-    from ..bot import _topic_names, _worktree_sources, _sanitize_tmux_name
+    from ..bot import _topic_names, _sanitize_tmux_name
 
     assert update.message is not None
 
@@ -360,12 +360,14 @@ async def _handle_accept_command(
         except Exception as e:
             logger.warning("Failed to update pool file: %s", e)
 
-    # Ask conversational Claude to write the plan (while still elevated)
+    # Ask conversational Claude to write the plan (while still elevated).
+    # The session stays elevated — Claude needs time to write. De-escalation
+    # happens on the next regular message (auto-restart detects elevated state).
     plan_prompt = (
-        f"Write a structured implementation plan to {worktree_path}/.claude/plans/{plan_slug}.md — "
-        f"include epic, stories, tasks, and all research context from our conversation. "
-        f"This plan will be used by a new Claude session to implement the changes. "
-        f"Write the plan now, then say 'Plan written' when done."
+        f"Write a structured implementation plan to {worktree_path}/work/wip/{plan_slug}/epic.md — "
+        f"use epic/story/task format. Include all research context from our conversation. "
+        f"Create stories/ subdirectory with individual story files if needed. "
+        f"This plan will be used by a new Claude session to implement the changes."
     )
     await session_manager.send_to_window(window_id, plan_prompt)
 
@@ -397,13 +399,11 @@ async def _handle_accept_command(
                     window_name=created_name,
                 )
             _topic_names[(dev_chat_id, new_thread_id)] = worktree_name
-            _worktree_sources[worktree_name] = (chat_id, thread_id)
-            # Also persist in session state (survives restart)
+            # Persist worktree→source mapping (survives restart)
             key = session_manager._topic_key(chat_id, thread_id)
             session_manager.worktree_sources[worktree_name] = key
             session_manager._save_state()
 
-            # Notify conversational topic with link
             link_chat_id = str(dev_chat_id).replace("-100", "")
             topic_link = f"https://t.me/c/{link_chat_id}/{new_thread_id}"
             await safe_reply(
@@ -421,13 +421,6 @@ async def _handle_accept_command(
             update.message,
             f"Worktree created at `{worktree_path}`. No dev group configured.",
         )
-
-    # De-escalate conversational session back to read-only
-    ok, new_wid, err = await _restart_session_with_permissions(
-        chat_id, thread_id, window_id, elevated=False
-    )
-    if not ok:
-        logger.warning("Failed to de-escalate after $accept: %s", err)
 
 
 async def _handle_new_command(
@@ -479,13 +472,29 @@ async def _handle_new_command(
                 window_name=created_name,
             )
 
-            # Carry context: ask the old session to summarize for the new one
-            summary_prompt = (
-                f"Summarize the current conversation context concisely — "
-                f"the user is moving to a new topic '{topic_title}'. "
-                f"Output only the summary, nothing else."
+            # Carry context: tell the NEW session about the prior conversation
+            import asyncio as _asyncio
+
+            await _asyncio.sleep(2.0)  # wait for Claude to start
+            context_prompt = (
+                f"This topic was created from another conversation. "
+                f"The previous topic was discussing: {topic_title}. "
+                f"The user wanted to continue this in a dedicated topic. "
+                f"Do not respond to this context message, just use it as background."
             )
-            await session_manager.send_to_window(window_id, summary_prompt)
+            await session_manager.send_to_window(created_wid, context_prompt)
+            await _asyncio.sleep(3.0)
+            # Skip past context exchange
+            sess = await session_manager.resolve_session_for_window(created_wid)
+            if sess and sess.file_path:
+                try:
+                    from pathlib import Path as _Path
+
+                    fsize = _Path(sess.file_path).stat().st_size
+                    for uid in config.allowed_users:
+                        session_manager.update_user_window_offset(uid, created_wid, fsize)
+                except OSError:
+                    pass
 
     # Reply with link to new topic
     link_chat_id = str(chat_id).replace("-100", "")
@@ -546,28 +555,21 @@ async def _handle_merge_command(
         except Exception:
             pass
 
+    # Merge from the main worktree (not bare repo — checkout on bare is dangerous)
+    main_worktree = project_dir / f"{project_name}-{default_branch}"
+
     try:
-        # Merge worktree branch into default branch
+        # Merge worktree branch into default branch via main worktree
+        if main_worktree.is_dir():
+            merge_dir = str(main_worktree)
+        else:
+            # Fallback: use bare repo (less safe but works)
+            merge_dir = str(bare_repo)
+
         subprocess.run(
-            ["git", "-C", str(bare_repo), "checkout", default_branch],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        subprocess.run(
-            [
-                "git",
-                "-C",
-                str(bare_repo),
-                "merge",
-                "--no-ff",
-                worktree_name,
-                "-m",
-                f"Merge {worktree_name} into {default_branch}",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
+            ["git", "-C", merge_dir, "merge", "--no-ff", worktree_name,
+             "-m", f"Merge {worktree_name} into {default_branch}"],
+            check=True, capture_output=True, text=True,
         )
 
         # Remove worktree
@@ -653,16 +655,17 @@ async def handle_conversational_message(
     if not wid:
         # Need to create a conversational session
         project_name = config.project_for_group(chat_id)
-        if not project_name:
-            # Dev group -- no project mapping, use directory browser later
-            # For now, respond that we need a project context
+        if not project_name and config.is_dev_group(chat_id):
+            # Dev group conversational topic — use projects base dir
+            work_dir = str(config.projects_dir)
+        elif project_name:
+            work_dir = _resolve_conversational_dir(project_name)
+        else:
             await safe_reply(
                 update.message,
-                "❌ Dev group conversational topics are not yet implemented.",
+                "❌ This group is not configured. Contact an admin.",
             )
             return
-
-        work_dir = _resolve_conversational_dir(project_name)
         topic_name = _topic_names.get((chat_id, thread_id or 0))
         tmux_name = f"{project_name}-chat"
         if topic_name:
@@ -683,12 +686,23 @@ async def handle_conversational_message(
         if context.user_data:
             resume_id = context.user_data.pop("_conv_resume_session_id", None)
 
-        success, message, created_name, created_wid = await tmux_manager.create_window(
-            work_dir,
-            window_name=tmux_name,
-            allowed_tools="Read,Glob,Grep,Agent,WebSearch,WebFetch,LSP",
-            resume_session_id=resume_id,
-        )
+        # Respect persisted permission state (e.g., $plan was active before restart)
+        perm_state = session_manager.get_topic_permission(chat_id, thread_id)
+        if perm_state == "elevated":
+            success, message, created_name, created_wid = (
+                await tmux_manager.create_window(
+                    work_dir, window_name=tmux_name,
+                    skip_permissions=True, resume_session_id=resume_id,
+                )
+            )
+        else:
+            success, message, created_name, created_wid = (
+                await tmux_manager.create_window(
+                    work_dir, window_name=tmux_name,
+                    allowed_tools="Read,Glob,Grep,Agent,WebSearch,WebFetch,LSP",
+                    resume_session_id=resume_id,
+                )
+            )
         if not success:
             await safe_reply(update.message, f"❌ {message}")
             return

@@ -310,9 +310,13 @@ async def handle_new_message(msg: object, bot: Bot) -> None:
         f"text_len={len(msg.text)}"
     )
 
-    # Check topic_bindings first (conversational topics -- deliver to topic, not per-user)
+    # Check topic_bindings first (conversational topics — deliver to topic, not per-user)
     active_topics = await session_manager.find_topics_for_session(msg.session_id)
-    if active_topics and msg.is_complete:
+    if active_topics and (msg.is_complete or msg.tool_name in INTERACTIVE_TOOL_NAMES):
+        # Skip user messages — don't echo back what the user sent
+        if msg.role == "user":
+            return
+
         # Post-process text with GitHub links for conversational topics
         processed_text = msg.text
         if msg.content_type == "text" and msg.role == "assistant":

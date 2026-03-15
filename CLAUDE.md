@@ -21,7 +21,7 @@ After modifying any source file under `src/ccbot/`, you MUST run `dev bot restar
 - **Session-per-instance** — each Claude instance gets its own tmux session (not a window inside a shared session). Sessions are discoverable by `dev go` and attachable from the terminal.
 - **Two topic types** — Conversational topics (human-created, multi-user, `topic_bindings`) and Dev session topics (bot-created, 1:1 with tmux, `thread_bindings`). All internal routing keyed by tmux window ID (`@0`, `@12`).
 - **Two group types** — Conversational groups (`CONVERSATIONAL_GROUPS`, per-project, multi-user) and Dev group (`DEV_GROUP`, single, DEV_USERS only). User-created topics are always conversational.
-- **Safety through workflow** — conversational sessions run with `--dangerously-skip-permissions` (read + plan freely). Code changes only happen after plan acceptance in a dedicated worktree session.
+- **Safety through workflow** — conversational sessions start read-only (`--allowedTools Read,Glob,Grep,Agent,WebSearch,WebFetch,LSP`). `$plan` elevates to full permissions for planning. `$accept` delegates to a worktree dev session and returns to read-only.
 - **No message truncation** at parse layer — splitting only at send layer (`split_message`, 4096 char limit).
 - **MarkdownV2 only** — use `safe_reply`/`safe_edit`/`safe_send` helpers (auto fallback to plain text). Internal queue/UI code calls bot API directly with its own fallback.
 - **Hook-based session tracking** — `SessionStart` hook writes `session_map.json`; monitor polls it to detect session changes.

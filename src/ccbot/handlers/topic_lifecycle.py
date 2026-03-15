@@ -43,15 +43,25 @@ async def topic_closed_handler(
     if thread_id is None:
         return
 
+    # Check thread_bindings (dev topics) and topic_bindings (conversational topics)
+    chat = update.effective_chat
+    chat_id = chat.id if chat else None
+
     wid = session_manager.get_window_for_thread(user.id, thread_id)
+    binding_type = "thread"
+    if not wid and chat_id:
+        wid = session_manager.get_window_for_topic(chat_id, thread_id)
+        binding_type = "topic"
+
     if wid:
         display = session_manager.get_display_name(wid)
         w = await tmux_manager.find_window_by_id(wid)
         if w:
             await tmux_manager.kill_window(w.window_id)
             logger.info(
-                "Topic closed: killed window %s (user=%d, thread=%d)",
+                "Topic closed: killed window %s (%s binding, user=%d, thread=%d)",
                 display,
+                binding_type,
                 user.id,
                 thread_id,
             )
@@ -62,8 +72,10 @@ async def topic_closed_handler(
                 user.id,
                 thread_id,
             )
-        session_manager.unbind_thread(user.id, thread_id)
-        # Clean up all memory state for this topic
+        if binding_type == "topic" and chat_id:
+            session_manager.unbind_topic(chat_id, thread_id)
+        else:
+            session_manager.unbind_thread(user.id, thread_id)
         await clear_topic_state(user.id, thread_id, context.bot, context.user_data)
     else:
         logger.debug(
@@ -120,7 +132,11 @@ async def topic_edited_handler(
     if chat and thread_id:
         _topic_names[(chat.id, thread_id)] = new_name
 
+    # Check both thread_bindings and topic_bindings
+    chat_id = chat.id if chat else None
     wid = session_manager.get_window_for_thread(user.id, thread_id)
+    if not wid and chat_id:
+        wid = session_manager.get_window_for_topic(chat_id, thread_id)
     if not wid:
         logger.debug(
             "Topic edited: no binding (user=%d, thread=%d)", user.id, thread_id

@@ -186,6 +186,35 @@ async def status_poll_loop(bot: Bot) -> None:
                         f"Status update error for user {user_id} "
                         f"thread {thread_id}: {e}"
                     )
+
+            # Also poll conversational topic_bindings for interactive UI detection
+            for topic_chat_id, topic_thread_id, wid in list(
+                session_manager.iter_topic_bindings()
+            ):
+                try:
+                    w = await tmux_manager.find_window_by_id(wid)
+                    if not w:
+                        session_manager.unbind_topic(topic_chat_id, topic_thread_id)
+                        logger.info(
+                            "Cleaned up stale topic binding: chat=%s thread=%s wid=%s",
+                            topic_chat_id,
+                            topic_thread_id,
+                            wid,
+                        )
+                        continue
+
+                    # Use chat_id as synthetic user_id for the polling function
+                    await update_status_message(
+                        bot,
+                        topic_chat_id,
+                        wid,
+                        thread_id=topic_thread_id,
+                    )
+                except Exception as e:
+                    logger.debug(
+                        f"Topic status update error for chat {topic_chat_id} "
+                        f"thread {topic_thread_id}: {e}"
+                    )
         except Exception as e:
             logger.error(f"Status poll loop error: {e}")
 

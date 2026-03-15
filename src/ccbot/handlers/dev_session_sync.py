@@ -146,11 +146,39 @@ async def reconcile_dev_topics(bot: Bot) -> None:
     if created:
         logger.info("Reconciliation: created %d dev topics", created)
 
+    # Clean up stale dev topics (bound to windows that no longer exist)
+    active_wids = set()
+    for map_key in session_map:
+        if ":" in map_key:
+            _, wid = map_key.rsplit(":", 1)
+            active_wids.add(wid)
+
+    closed = 0
+    for user_id, thread_id, wid in list(session_manager.iter_thread_bindings()):
+        chat_id = session_manager.resolve_chat_id(user_id, thread_id)
+        if chat_id != config.dev_group:
+            continue
+        if wid in active_wids:
+            continue
+        # This dev topic's window no longer exists — close it
+        try:
+            await bot.close_forum_topic(
+                chat_id=config.dev_group, message_thread_id=thread_id
+            )
+            closed += 1
+        except Exception as e:
+            logger.debug("Failed to close stale dev topic: %s", e)
+        session_manager.unbind_thread(user_id, thread_id)
+        logger.info(
+            "Reconciled: closed stale dev topic (thread=%d, was %s)", thread_id, wid
+        )
+
+    if closed:
+        logger.info("Reconciliation: closed %d stale dev topics", closed)
+
 
 async def handle_session_removed(window_id: str, bot: Bot) -> None:
     """Handle a tmux session being killed -- close the dev topic and send merge reminder."""
-    from ..bot import _worktree_sources
-
     if not config.dev_group:
         return
 
@@ -182,16 +210,12 @@ async def handle_session_removed(window_id: str, bot: Bot) -> None:
         await clear_topic_state(user_id, thread_id, bot)
 
     # Send merge reminder to source conversational topic if this was a worktree session
-    source = _worktree_sources.pop(display_name, None)
-    # Also check persisted state (survives restart)
-    if not source:
-        persisted_key = session_manager.worktree_sources.pop(display_name, None)
-        if persisted_key:
-            parts = persisted_key.split(":", 1)
-            source = (int(parts[0]), int(parts[1]) if parts[1] != "0" else None)
-            session_manager._save_state()
-    if source:
-        source_chat_id, source_thread_id = source
+    persisted_key = session_manager.worktree_sources.pop(display_name, None)
+    if persisted_key:
+        session_manager._save_state()
+        parts = persisted_key.split(":", 1)
+        source_chat_id = int(parts[0])
+        source_thread_id = int(parts[1]) if parts[1] != "0" else None
         try:
             await safe_send(
                 bot,
