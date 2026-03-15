@@ -88,6 +88,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.chat.send_action(ChatAction.TYPING)
     clear_status_msg_info(user.id, thread_id)
 
+    session_manager.mark_telegram_input(wid)
     success, message = await session_manager.send_to_window(wid, text_to_send)
     if not success:
         await safe_reply(update.message, f"❌ {message}")
@@ -163,6 +164,7 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.chat.send_action(ChatAction.TYPING)
     clear_status_msg_info(user.id, thread_id)
 
+    session_manager.mark_telegram_input(wid)
     success, message = await session_manager.send_to_window(wid, text)
     if not success:
         await safe_reply(update.message, f"❌ {message}")

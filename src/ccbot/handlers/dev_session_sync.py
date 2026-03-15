@@ -162,7 +162,7 @@ async def reconcile_dev_topics(bot: Bot) -> None:
             continue
         # This dev topic's window no longer exists — close it
         try:
-            await bot.close_forum_topic(
+            await bot.delete_forum_topic(
                 chat_id=config.dev_group, message_thread_id=thread_id
             )
             closed += 1
@@ -170,7 +170,7 @@ async def reconcile_dev_topics(bot: Bot) -> None:
             logger.debug("Failed to close stale dev topic: %s", e)
         session_manager.unbind_thread(user_id, thread_id)
         logger.info(
-            "Reconciled: closed stale dev topic (thread=%d, was %s)", thread_id, wid
+            "Reconciled: deleted stale dev topic (thread=%d, was %s)", thread_id, wid
         )
 
     if closed:
@@ -195,11 +195,11 @@ async def handle_session_removed(window_id: str, bot: Bot) -> None:
 
         # Close the topic in the dev group
         try:
-            await bot.close_forum_topic(
+            await bot.delete_forum_topic(
                 chat_id=config.dev_group, message_thread_id=thread_id
             )
             logger.info(
-                "Closed dev topic (thread=%d) for removed window %s",
+                "Deleted dev topic (thread=%d) for removed window %s",
                 thread_id,
                 window_id,
             )

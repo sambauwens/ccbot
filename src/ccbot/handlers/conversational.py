@@ -797,6 +797,7 @@ async def handle_conversational_message(
 
     prefixed_text = f"[{first_name}] {text}"
     await update.message.chat.send_action(ChatAction.TYPING)
+    session_manager.mark_telegram_input(wid)
     success, msg = await session_manager.send_to_window(wid, prefixed_text)
     if not success:
         await safe_reply(update.message, f"❌ {msg}")

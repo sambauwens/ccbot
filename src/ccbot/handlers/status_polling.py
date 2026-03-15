@@ -154,12 +154,12 @@ async def status_poll_loop(bot: Bot) -> None:
                             chat_id
                         ) or config.is_dev_group(chat_id):
                             try:
-                                await bot.close_forum_topic(
+                                await bot.delete_forum_topic(
                                     chat_id=chat_id,
                                     message_thread_id=thread_id,
                                 )
                                 logger.info(
-                                    "Auto-closed topic: chat=%d thread=%d",
+                                    "Auto-deleted topic: chat=%d thread=%d",
                                     chat_id,
                                     thread_id,
                                 )

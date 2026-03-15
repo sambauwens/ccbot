@@ -927,6 +927,22 @@ class SessionManager:
                 result.append((user_id, window_id, thread_id))
         return result
 
+    # --- Telegram input tracking ---
+    # Windows that just received input from Telegram (not terminal).
+    # Used to suppress echoing user messages back to Telegram.
+    _telegram_input_windows: set[str] = field(default_factory=set)
+
+    def mark_telegram_input(self, window_id: str) -> None:
+        """Mark that this window just received input from Telegram."""
+        self._telegram_input_windows.add(window_id)
+
+    def was_telegram_input(self, window_id: str) -> bool:
+        """Check if last input was from Telegram (consumes the flag)."""
+        if window_id in self._telegram_input_windows:
+            self._telegram_input_windows.discard(window_id)
+            return True
+        return False
+
     # --- Tmux helpers ---
 
     async def send_to_window(self, window_id: str, text: str) -> tuple[bool, str]:

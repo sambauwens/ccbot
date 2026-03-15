@@ -284,6 +284,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "wait for the user to return to terminal before taking further action.)"
         )
 
+    session_manager.mark_telegram_input(wid)
     success, message = await session_manager.send_to_window(wid, send_text)
     if not success:
         await safe_reply(update.message, f"❌ {message}")
@@ -324,9 +325,12 @@ async def handle_new_message(msg: object, bot: Bot) -> None:
     # Check topic_bindings first (conversational topics — deliver to topic, not per-user)
     active_topics = await session_manager.find_topics_for_session(msg.session_id)
     if active_topics and (msg.is_complete or msg.tool_name in INTERACTIVE_TOOL_NAMES):
-        # Skip user messages — don't echo back what the user sent
+        # Skip user messages sent from Telegram (already visible); forward terminal ones
         if msg.role == "user":
-            return
+            for _, _, wid in active_topics:
+                if session_manager.was_telegram_input(wid):
+                    return
+            # Message came from terminal — fall through to forward it
 
         # Post-process text with GitHub links for conversational topics
         processed_text = msg.text
@@ -367,6 +371,10 @@ async def handle_new_message(msg: object, bot: Bot) -> None:
         return
 
     for user_id, wid, thread_id in active_users:
+        # Skip user messages sent from Telegram (already visible); forward terminal ones
+        if msg.role == "user" and session_manager.was_telegram_input(wid):
+            continue
+
         # Handle interactive tools specially - capture terminal and send UI
         if msg.tool_name in INTERACTIVE_TOOL_NAMES and msg.content_type == "tool_use":
             # Mark interactive mode BEFORE sleeping so polling skips this window
