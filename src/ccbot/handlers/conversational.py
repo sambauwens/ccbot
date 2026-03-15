@@ -726,22 +726,33 @@ async def handle_conversational_message(
         wid = created_wid
 
         # Instruct the session for conversational behavior.
-        # Wait briefly for Claude to be ready, send instruction, then wait for
-        # Claude to process it. Skip the instruction exchange in monitoring by
-        # advancing the read offset past it.
+        # Sent on every creation (including --resume) since the new session needs
+        # to know its current permissions regardless of what the old session had.
         import asyncio as _asyncio
 
         await _asyncio.sleep(2.0)
+        perm_state = session_manager.get_topic_permission(chat_id, thread_id)
+        if perm_state == "elevated":
+            instruction = (
+                "You are in a conversational Telegram topic in planning mode. "
+                "You have full permissions. Write plan files, explore, research."
+            )
+        else:
+            instruction = (
+                "You are in a conversational Telegram topic with multiple users. "
+                "You are in READ-ONLY mode. You CANNOT write, edit, or create files. "
+                "Do NOT attempt to use Write, Edit, or Bash tools. "
+                "If changes are needed, tell the user to run $plan first.\n"
+                "Follow these guidelines:\n"
+                "- When the conversation leads toward code changes, suggest $plan.\n"
+                "- When the conversation drifts to a different subject, suggest "
+                "$new <suggested-title> to move the discussion to a dedicated topic.\n"
+                "- Keep responses conversational."
+            )
         await session_manager.send_to_window(
             created_wid,
-            "You are in a conversational Telegram topic with multiple users. "
-            "Follow these guidelines:\n"
-            "- When the conversation leads toward code changes, suggest $plan.\n"
-            "- When the conversation drifts to a different subject, suggest "
-            "$new <suggested-title> to move the discussion to a dedicated topic.\n"
-            "- Keep responses conversational.\n"
-            "- Do not respond to this message, just acknowledge silently and wait "
-            "for the first real user message.",
+            instruction + "\nDo not respond to this message, just acknowledge "
+            "silently and wait for the next real user message.",
         )
         # Give Claude time to process, then skip past this exchange
         await _asyncio.sleep(5.0)
