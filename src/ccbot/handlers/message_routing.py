@@ -273,7 +273,18 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         # Small delay to let UI render in Telegram before text arrives
         await asyncio.sleep(0.3)
 
-    success, message = await session_manager.send_to_window(wid, text)
+    # For dev sessions via Telegram: append wait instruction so user can switch to terminal.
+    # Requirement: "it takes my input and then the claude session waits so i can switch
+    # back to terminal experience and continue work with the cli there"
+    send_text = text
+    if not text.startswith("!") and not text.startswith("/"):
+        send_text = (
+            f"{text}\n\n"
+            "(This message was sent from Telegram. After processing, "
+            "wait for the user to return to terminal before taking further action.)"
+        )
+
+    success, message = await session_manager.send_to_window(wid, send_text)
     if not success:
         await safe_reply(update.message, f"❌ {message}")
         return
