@@ -15,6 +15,7 @@ State dicts are keyed by (user_id, thread_id_or_0) for Telegram topic support.
 """
 
 import logging
+import re as _re
 
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -25,6 +26,7 @@ from .callback_data import (
     CB_ASK_DOWN,
     CB_ASK_ENTER,
     CB_ASK_ESC,
+    CB_ASK_KEYS,
     CB_ASK_LEFT,
     CB_ASK_REFRESH,
     CB_ASK_RIGHT,
@@ -77,19 +79,76 @@ def get_interactive_msg_id(user_id: int, thread_id: int | None = None) -> int | 
     return _interactive_msgs.get((user_id, thread_id or 0))
 
 
+def _parse_choices(content_text: str) -> list[str]:
+    """Parse numbered choices from interactive UI content.
+
+    Looks for patterns like:
+      ❯ 1. Yes
+        2. No
+    or:
+      ☐ Option A
+      ☐ Option B
+    Returns list of choice labels, or empty if no clear choices found.
+    """
+    choices = []
+    for line in content_text.split("\n"):
+        stripped = line.strip()
+        # Numbered choices: "❯ 1. Yes" or "2. No"
+        m = _re.match(r"^[❯\s]*\d+\.\s+(.+)$", stripped)
+        if m:
+            choices.append(m.group(1).strip())
+            continue
+        # Checkbox choices: "☐ Option A" or "✔ Option A"
+        m = _re.match(r"^[☐✔☒]\s+(.+)$", stripped)
+        if m:
+            choices.append(m.group(1).strip())
+    return choices
+
+
 def _build_interactive_keyboard(
     window_id: str,
     ui_name: str = "",
+    content_text: str = "",
 ) -> InlineKeyboardMarkup:
     """Build keyboard for interactive UI navigation.
 
-    ``ui_name`` controls the layout: ``RestoreCheckpoint`` omits ←/→ keys
-    since only vertical selection is needed.
+    If clear choices are found (1. Yes / 2. No), creates direct-action
+    buttons. Otherwise falls back to generic navigation.
     """
+    choices = _parse_choices(content_text) if content_text else []
+
+    if choices and len(choices) <= 4:
+        # Smart choice buttons — each one navigates to that choice and presses Enter
+        # For numbered choices: press the number key directly
+        rows: list[list[InlineKeyboardButton]] = []
+        for i, choice in enumerate(choices):
+            # Send the number key (1, 2, 3...) to select the choice
+            key = str(i + 1)
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        choice,
+                        callback_data=f"{CB_ASK_KEYS}{key}:{window_id}"[:64],
+                    )
+                ]
+            )
+        # Add Esc and Refresh as small row
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "⎋ Esc", callback_data=f"{CB_ASK_ESC}{window_id}"[:64]
+                ),
+                InlineKeyboardButton(
+                    "🔄", callback_data=f"{CB_ASK_REFRESH}{window_id}"[:64]
+                ),
+            ]
+        )
+        return InlineKeyboardMarkup(rows)
+
+    # Fallback: generic navigation keyboard
     vertical_only = ui_name == "RestoreCheckpoint"
 
-    rows: list[list[InlineKeyboardButton]] = []
-    # Row 1: directional keys
+    rows = []
     rows.append(
         [
             InlineKeyboardButton(
@@ -123,7 +182,6 @@ def _build_interactive_keyboard(
                 ),
             ]
         )
-    # Row 2: action keys
     rows.append(
         [
             InlineKeyboardButton(
@@ -179,7 +237,9 @@ async def handle_interactive_ui(
         return False
 
     # Build message with navigation keyboard
-    keyboard = _build_interactive_keyboard(window_id, ui_name=content.name)
+    keyboard = _build_interactive_keyboard(
+        window_id, ui_name=content.name, content_text=content.content
+    )
 
     # Send as plain text (no markdown conversion)
     text = content.content

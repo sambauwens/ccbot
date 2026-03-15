@@ -48,6 +48,7 @@ from .handlers.callback_data import (
     CB_ASK_ENTER,
     CB_ASK_ESC,
     CB_ASK_LEFT,
+    CB_ASK_KEYS,
     CB_ASK_REFRESH,
     CB_ASK_RIGHT,
     CB_ASK_SPACE,
@@ -331,6 +332,18 @@ async def _create_and_bind_window(
 
 
 # --- Callback query handler ---
+
+
+def _resolve_interactive_user_id(user_id: int, thread_id: int | None, chat_id: int | None) -> int:
+    """Resolve the correct user_id for interactive UI state.
+
+    For conversational topics (topic_bindings), the interactive state is keyed
+    by chat_id (negative), not by user.id. Check if there's a topic_binding
+    for this chat and return the chat_id if so.
+    """
+    if chat_id and session_manager.get_window_for_topic(chat_id, thread_id):
+        return chat_id
+    return user_id
 
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -811,7 +824,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if w:
             await tmux_manager.send_keys(w.window_id, "Up", enter=False, literal=False)
             await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
+            await handle_interactive_ui(context.bot, _resolve_interactive_user_id(user.id, thread_id, query.message.chat_id if query.message else None), window_id, thread_id)
         await query.answer()
 
     # Interactive UI: Down arrow
@@ -827,7 +840,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 w.window_id, "Down", enter=False, literal=False
             )
             await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
+            await handle_interactive_ui(context.bot, _resolve_interactive_user_id(user.id, thread_id, query.message.chat_id if query.message else None), window_id, thread_id)
         await query.answer()
 
     # Interactive UI: Left arrow
@@ -843,7 +856,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 w.window_id, "Left", enter=False, literal=False
             )
             await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
+            await handle_interactive_ui(context.bot, _resolve_interactive_user_id(user.id, thread_id, query.message.chat_id if query.message else None), window_id, thread_id)
         await query.answer()
 
     # Interactive UI: Right arrow
@@ -859,7 +872,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 w.window_id, "Right", enter=False, literal=False
             )
             await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
+            await handle_interactive_ui(context.bot, _resolve_interactive_user_id(user.id, thread_id, query.message.chat_id if query.message else None), window_id, thread_id)
         await query.answer()
 
     # Interactive UI: Escape
@@ -890,7 +903,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 w.window_id, "Enter", enter=False, literal=False
             )
             await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
+            await handle_interactive_ui(context.bot, _resolve_interactive_user_id(user.id, thread_id, query.message.chat_id if query.message else None), window_id, thread_id)
         await query.answer("⏎ Enter")
 
     # Interactive UI: Space
@@ -906,7 +919,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 w.window_id, "Space", enter=False, literal=False
             )
             await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
+            await handle_interactive_ui(context.bot, _resolve_interactive_user_id(user.id, thread_id, query.message.chat_id if query.message else None), window_id, thread_id)
         await query.answer("␣ Space")
 
     # Interactive UI: Tab
@@ -920,17 +933,44 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if w:
             await tmux_manager.send_keys(w.window_id, "Tab", enter=False, literal=False)
             await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
+            await handle_interactive_ui(context.bot, _resolve_interactive_user_id(user.id, thread_id, query.message.chat_id if query.message else None), window_id, thread_id)
         await query.answer("⇥ Tab")
 
     # Interactive UI: refresh display
-    elif data.startswith(CB_ASK_REFRESH):
-        window_id = data[len(CB_ASK_REFRESH) :]
+    # Interactive UI: Smart choice (send number key + Enter)
+    elif data.startswith(CB_ASK_KEYS):
+        rest = data[len(CB_ASK_KEYS):]
+        colon_idx = rest.find(":")
+        if colon_idx < 0:
+            await query.answer("Invalid data")
+            return
+        key_to_send = rest[:colon_idx]
+        window_id = rest[colon_idx + 1:]
         if not _is_valid_window_id(window_id):
             await query.answer("Invalid window ID")
             return
         thread_id = _get_thread_id(update)
-        await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
+        w = await tmux_manager.find_window_by_id(window_id)
+        if w:
+            # Send the number key, then Enter to confirm
+            await tmux_manager.send_keys(w.window_id, key_to_send, enter=False, literal=True)
+            await asyncio.sleep(0.3)
+            await tmux_manager.send_keys(w.window_id, "Enter", enter=False, literal=False)
+            await asyncio.sleep(0.5)
+            # Clear interactive UI since choice was made
+            effective_uid = _resolve_interactive_user_id(
+                user.id, thread_id, query.message.chat_id if query.message else None
+            )
+            await clear_interactive_msg(effective_uid, context.bot, thread_id)
+        await query.answer()
+
+    elif data.startswith(CB_ASK_REFRESH):
+        window_id = data[len(CB_ASK_REFRESH):]
+        if not _is_valid_window_id(window_id):
+            await query.answer("Invalid window ID")
+            return
+        thread_id = _get_thread_id(update)
+        await handle_interactive_ui(context.bot, _resolve_interactive_user_id(user.id, thread_id, query.message.chat_id if query.message else None), window_id, thread_id)
         await query.answer("🔄")
 
     # Screenshot quick keys: send key to tmux window
